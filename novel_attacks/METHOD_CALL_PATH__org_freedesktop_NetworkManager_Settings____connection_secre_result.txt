@@ -1,0 +1,90 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Target: A typical Linux desktop or server using NetworkManager on the **system bus**.
+  - NetworkManager exposes `org.freedesktop.NetworkManager.Settings.Connection` objects at paths like `/org/freedesktop/NetworkManager/Settings/*`.
+  - A privileged local component (for example, a desktop “network settings” helper or a generic D‑Bus proxy similar in design to `dde-api-proxy`) is installed.  
+    - This helper is allowed by PolicyKit / system bus policy to call `GetSecrets` on **any** `Settings.Connection` object.
+    - The helper forwards client‑supplied object paths directly into calls to `org.freedesktop.NetworkManager.Settings.Connection.GetSecrets` without validating that the path belongs to the calling user.
+  - This kind of design flaw (arbitrary client‑controlled PATH forwarded to privileged backends) has been described in public analyses of D‑Bus proxy services and specifically called out as dangerous for NetworkManager’s per‑connection objects.
+  - Attacker is a local unprivileged user who can talk to the helper (or, in a misconfigured system, directly to NetworkManager) but should not be able to read other users’ Wi‑Fi / VPN credentials.
+
+- **Attacker Capability:**
+  - Can send `METHOD_CALL` messages that ultimately reach NetworkManager with **attacker‑chosen `PATH`**.
+  - Can control:
+    - The `PATH` header field (OBJECT_PATH),
+    - The `INTERFACE` (`org.freedesktop.NetworkManager.Settings.Connection`),
+    - The `MEMBER` (`GetSecrets`),
+    - The method body parameters.
+  - Cannot directly bypass PolicyKit or D‑Bus policy; instead, exploits the fact that a privileged proxy/helper has overly broad permission and simply forwards the supplied `PATH`.
+
+---
+
+**Attack Procedure:**
+
+1. **Enumerate candidate object paths.**
+   - The attacker first calls `org.freedesktop.NetworkManager.Settings.ListConnections` (directly, or via the same proxy if exposed) to obtain a list of `Settings.Connection` object paths:
+     - e.g. `/org/freedesktop/NetworkManager/Settings/0`,
+            `/org/freedesktop/NetworkManager/Settings/1`,
+            `/org/freedesktop/NetworkManager/Settings/2`, …
+   - From the settings of these objects (using `GetSettings`) or from naming conventions, the attacker identifies which path corresponds to a victim’s connection, e.g. the corporate Wi‑Fi or a VPN profile:
+     - e.g. `/org/freedesktop/NetworkManager/Settings/1`.
+
+2. **Craft a malicious `GetSecrets` call with a forged PATH.**
+   - Instead of requesting secrets for their own connection, the attacker crafts (or causes the proxy to craft) a `METHOD_CALL` targeting:
+     - `DESTINATION`: `org.freedesktop.NetworkManager`
+     - `PATH`: `/org/freedesktop/NetworkManager/Settings/1` (victim’s connection)
+     - `INTERFACE`: `org.freedesktop.NetworkManager.Settings.Connection`
+     - `MEMBER`: `GetSecrets`
+   - Body arguments are chosen so that NetworkManager returns all secrets for that connection (e.g., empty filter or appropriate flags).
+
+3. **Privilege boundary crossed at object path selection.**
+   - The privileged helper or D‑Bus policy has been written in a coarse manner such as:
+     - “Allow user to call `GetSecrets` on NetworkManager.”
+   - Crucially, it **does not restrict the allowed PATHs** (e.g., to connections that the user created).
+   - NetworkManager itself assumes the caller is fully authorized (because PolicyKit/bus policy has already allowed the call) and trusts the `PATH` to specify *which* connection to operate on. The service does not infer ownership from the caller; the object path is the only discriminator.
+
+4. **Secrets disclosure.**
+   - NetworkManager executes `GetSecrets` on `/org/freedesktop/NetworkManager/Settings/1` and returns an `a{sa{sv}}` structure containing credentials, such as:
+     - WPA2/WPA3 Wi‑Fi passphrases,
+     - Enterprise Wi‑Fi EAP credentials,
+     - VPN usernames/passwords or private keys.
+   - The helper/proxy passes this reply back to the attacker.
+
+5. **Why PATH is exploit‑critical.**
+   - If the attacker sets `PATH` to an object path corresponding to their **own** connection, NetworkManager returns only secrets they are legitimately allowed to manage; no privilege escalation occurs.
+   - The attack only becomes security‑relevant when the attacker chooses a `PATH` identifying **someone else’s or a system connection**, which is exactly what arbitrary `PATH` control enables.
+   - Other fields (e.g., `DESTINATION`, `INTERFACE`, `MEMBER`) are fixed by the helper design; the vulnerability lies in the lack of constraints on the **object path** that scopes which connection’s secrets are returned.
+   - This pattern matches real‑world D‑Bus proxy flaws described in security research, where unrestricted forwarding of client‑controlled OBJECT_PATHs to privileged NetworkManager `GetSecrets` led to data‑exfiltration vulnerabilities.
+
+---
+
+**Attack Message:**
+
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": "METHOD_CALL",
+    "flags": 0,
+    "protocol_version": 1,
+    "serial": 12
+  },
+  "header_fields": {
+    "PATH": "/org/freedesktop/NetworkManager/Settings/1",
+    "INTERFACE": "org.freedesktop.NetworkManager.Settings.Connection",
+    "MEMBER": "GetSecrets",
+    "DESTINATION": "org.freedesktop.NetworkManager",
+    "SIGNATURE": "a{sa{sv}}us"
+  },
+  "body": {
+    "settings": {},
+    "flags": 0,
+    "secret_name": ""
+  },
+  "_exploit_context": "PATH is the exploit-critical field. Setting PATH=/org/freedesktop/NetworkManager/Settings/1 selects a specific Settings.Connection object that belongs to another user or a system profile. In vulnerable designs, a privileged helper or generic D-Bus proxy forwards this client-controlled PATH directly to NetworkManager's GetSecrets without constraining which paths are allowed. NetworkManager, seeing a PolicyKit-approved call, returns Wi-Fi/VPN credentials for that object. Using a PATH for the attacker's own connection would not leak additional privileges. This class of flaw has been highlighted in public analyses of D-Bus proxy services (e.g., dde-api-proxy-style path-forwarding bugs) where arbitrary OBJECT_PATH forwarding to NetworkManager resulted in credential disclosure."
+}
+```
+
+---
+
+**Classification:** ATTACK

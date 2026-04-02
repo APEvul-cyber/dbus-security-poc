@@ -1,0 +1,147 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Target is a typical Linux system using the system bus (`/usr/bin/dbus-daemon`) with standard freedesktop.org semantics.
+  - A privileged, root-owned service `com.example.PrivilegedConfig1` is installed on the system bus. It:
+    - Exposes an object `/com/example/PrivilegedConfig1`.
+    - Implements `org.freedesktop.DBus.Properties` on that object.
+    - Uses `Properties.Set()` to modify root-owned configuration files (e.g., in `/etc/example.conf`).
+  - The system administrator (or distro) has installed a D‑Bus policy that:
+    - *Intends* to deny unprivileged callers from changing properties by using rules like:
+      - `deny send_interface="org.freedesktop.DBus.Properties" send_destination="com.example.PrivilegedConfig1" send_path="/com/example/PrivilegedConfig1" send_member="Set"`.
+  - The service is implemented with a common D‑Bus binding (e.g., GLib’s GDBus, libdbus) that:
+    - Is willing to dispatch `METHOD_CALL`s that omit the `INTERFACE` header as long as the path + member uniquely match a known method (in this case, the `Set` method of `org.freedesktop.DBus.Properties`).
+  - Local unprivileged user can connect to the system bus (default on most Linux systems).
+
+- **Attacker Capability:**
+  - Can send arbitrary `METHOD_CALL` messages on the system bus as an unprivileged local user.
+  - Has full control over the `INTERFACE` header field for those calls, including the ability to:
+    - Set it to any string, or
+    - Omit the `INTERFACE` header entirely.
+  - Can control the message body (method arguments) for `Properties.Set`, including `interface_name`, `property_name`, and `value`.
+
+---
+
+**Attack Procedure:**
+
+1. **Understand the policy mismatch:**
+   - According to the D‑Bus specification (“Header Fields” → `INTERFACE`, and “Method Calls”), `INTERFACE` on a `METHOD_CALL` is *optional*.
+   - The spec explicitly warns: if you write filters or access-control rules that match on `INTERFACE`, you *must also reject messages that have no INTERFACE field*, otherwise malicious callers can bypass the filter.
+   - Here, the bus policy denies:
+     - `send_interface="org.freedesktop.DBus.Properties"` for the privileged service/path/member.
+   - But it does **not** deny messages that:
+     - Have no `INTERFACE` header at all.
+   - The service’s dispatcher, however, is configured to accept calls based on `PATH + MEMBER`, and will dispatch a `Set` call even if `INTERFACE` is missing.
+
+2. **Craft a malicious `METHOD_CALL`:**
+   - The attacker constructs a `METHOD_CALL` to:
+     - `destination = "com.example.PrivilegedConfig1"`
+     - `path = "/com/example/PrivilegedConfig1"`
+     - `member = "Set"`
+     - `signature = "ssv"` (matching `org.freedesktop.DBus.Properties.Set`)
+   - Crucially, the attacker **leaves out the `INTERFACE` header field entirely**.
+     - If the attacker set `INTERFACE = "org.freedesktop.DBus.Properties"`, the bus policy would block the call.
+     - By omitting it, the message no longer matches the `send_interface` deny rule.
+
+3. **Select a sensitive property to modify:**
+   - Assume the service exposes a property such as:
+     - `ConfigFilePath` or `AuthorizedKeysPath` or `EnableRootScript`.
+   - Or more realistically, a property that influences:
+     - What script is executed as root on some trigger.
+     - Where logs or backups are stored (path under root’s control but attacker-chosen).
+   - The attacker chooses property arguments, for example:
+     - `interface_name = "com.example.PrivilegedConfig1.Config"`
+     - `property_name = "PreLoginScript"`
+     - `value = "/tmp/attacker-root.sh"` (a script the attacker controls).
+
+4. **Send the message and bypass policy:**
+   - The system bus receives the call.
+   - When evaluating policy, it:
+     - Checks for rules matching the destination, path, member, *and* possibly interface.
+     - The only deny rule that would block this action is constrained by `send_interface="org.freedesktop.DBus.Properties"`.
+     - Because the `INTERFACE` header is absent, the message does **not** match this rule.
+   - Result: the bus forwards the method call to `com.example.PrivilegedConfig1`.
+
+5. **Service dispatch and privileged behavior:**
+   - The D‑Bus binding in the service receives the call and resolves it:
+     - It uses `PATH = /com/example/PrivilegedConfig1` and `MEMBER = Set`.
+     - It finds the unique `Set` method on `org.freedesktop.DBus.Properties`.
+     - It does **not** insist that the incoming `INTERFACE` header equals `"org.freedesktop.DBus.Properties"`, and allows the call even when `INTERFACE` is missing.
+   - The handler executes with the service’s privileges (root), interpreting:
+     - `interface_name`, `property_name`, `value` from the body exactly as if the call had a proper INTERFACE field.
+   - The service then:
+     - Writes to its root-owned configuration files in `/etc` or equivalent, applying the attacker’s chosen configuration.
+
+6. **Concrete impact / privilege escalation:**
+   - By carefully choosing the property and value, the attacker can:
+     - Configure a root-executed command to point to an attacker-controlled binary/script.
+     - Change a file path so that the service later writes to or reads from an arbitrary file that the attacker can influence, escalating to arbitrary file write, or code execution when some root process uses that configuration.
+   - For example:
+     - The service may have a property `StartupScript` that is executed as root at boot or on certain events.
+     - By setting `StartupScript` to `/tmp/attacker.sh`, the attacker ensures their script runs as root at the next trigger.
+   - This is a clear local privilege escalation: the attacker uses D‑Bus to get a root-owned service to perform sensitive file operations or execute arbitrary code.
+
+7. **Why `INTERFACE` control is the key:**
+   - With `INTERFACE` correctly set to `org.freedesktop.DBus.Properties`, the bus policy denies the call.
+   - With `INTERFACE` set to any other string, a typical binding will **not** dispatch to `Properties.Set` (thus no effect).
+   - Only by *omitting* the `INTERFACE` header entirely—something the spec permits and some bindings accept—does the attacker both:
+     - Bypass `send_interface`-based deny rules on the bus, **and**
+     - Still reach the privileged `Properties.Set` handler.
+   - The exploit therefore critically depends on attacker-controlled `INTERFACE` semantics: specifically the ability to omit it.
+
+---
+
+**Attack Message:**
+
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": "METHOD_CALL",
+    "flags": 0,
+    "protocol_version": 1,
+    "serial": 42
+  },
+  "header_fields": {
+    "PATH": "/com/example/PrivilegedConfig1",
+    "MEMBER": "Set",
+    "DESTINATION": "com.example.PrivilegedConfig1",
+    "SIGNATURE": "ssv"
+    /*
+      Note: INTERFACE is intentionally omitted here.
+      If INTERFACE were "org.freedesktop.DBus.Properties", the bus policy would deny this call.
+    */
+  },
+  "body": {
+    "args": [
+      {
+        "position": 0,
+        "type": "s",
+        "name": "interface_name",
+        "value": "com.example.PrivilegedConfig1.Config"
+      },
+      {
+        "position": 1,
+        "type": "s",
+        "name": "property_name",
+        "value": "StartupScript"
+      },
+      {
+        "position": 2,
+        "type": "v",
+        "name": "value",
+        "value_variant_type": "s",
+        "value": "/tmp/attacker-root.sh"
+      }
+    ]
+  },
+  "_exploit_context": {
+    "vulnerability_pattern": "Interface-omission policy bypass on org.freedesktop.DBus.Properties.Set",
+    "spec_reference": "D-Bus Specification: 'Header Fields' (INTERFACE) and 'Method Calls' – warning that interface-based filters must also reject messages without INTERFACE",
+    "why_interface_is_critical": "Bus policy denies send_interface='org.freedesktop.DBus.Properties'; omitting INTERFACE avoids the deny rule while GDBus/libdbus still dispatches Set() based on PATH+MEMBER."
+  }
+}
+```
+
+---
+
+**Classification:** ATTACK

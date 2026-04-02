@@ -1,0 +1,134 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Target platform: A typical Linux desktop (e.g., Fedora, Ubuntu, Debian) using the system D‑Bus and NetworkManager as the primary network management daemon.
+  - NetworkManager runs on the **system bus** under root (or a privileged system account) and owns the well‑known name `org.freedesktop.NetworkManager`.
+  - D‑Bus policy and polkit are configured in their common default way:
+    - Local, active console users are allowed to create and manage *user connections* via NetworkManager’s D‑Bus API (e.g., `AddConnection`) when authorized by polkit rules such as `org.freedesktop.NetworkManager.settings.modify.own`.
+  - The victim runs sandboxed or “constrained” applications (e.g., Flatpak app, containerized desktop app, or a process confined via a coarse sandbox which still has access to the system bus).
+  - The sandboxing framework *does not* correctly restrict D‑Bus destinations: it allows the sandboxed process to talk to the system bus with few or no restrictions on `DESTINATION`.
+  - The user expects the sandbox to prevent the application from reconfiguring host networking (e.g., changing DNS, routing) even though the user itself would normally be allowed to do so outside the sandbox.
+
+- **Attacker Capability:**
+  - The attacker controls a sandboxed application or process running under a regular, logged‑in user account.
+  - The attacker can send arbitrary D‑Bus `METHOD_CALL` messages on the **system bus** and has full control over the **`DESTINATION` header field** of those messages, as well as PATH, INTERFACE, MEMBER, and arguments.
+  - In particular, the attacker can set:
+    - `DESTINATION = "org.freedesktop.NetworkManager"`
+    - PATH, INTERFACE, MEMBER to valid NetworkManager API endpoints such as `AddConnection(a{sa{sv}})`.
+
+---
+
+**Attack Procedure:**
+
+1. **Enumerate environment / confirm access:**
+   - From inside the sandbox, the attacker checks that:
+     - The process can connect to the **system bus**.
+     - The `org.freedesktop.NetworkManager` name is present on the bus (using e.g. a simple D‑Bus call or an introspection if not blocked).
+   - This shows that the sandbox is *not* stripping or rewriting the `DESTINATION` header for system bus traffic.
+
+2. **Craft malicious NetworkManager configuration:**
+   - The attacker prepares a malicious NetworkManager connection profile in the format expected by `AddConnection(a{sa{sv}})`, for example:
+     - Set a network profile that:
+       - Forces DNS to an attacker‑controlled resolver (`evil.dns.server` / IP).
+       - Sets routes that divert traffic (e.g., default gateway via attacker).
+       - Enables `autoconnect` so the profile is used automatically when the network comes up.
+   - Example malicious settings (simplified):
+     - `ipv4.method = "manual"`
+     - `ipv4.addresses = ["192.0.2.10/24"]`
+     - `ipv4.gateway = "192.0.2.1"`
+     - `ipv4.dns = ["198.51.100.53"]` (attacker‑controlled DNS)
+     - `connection.id = "Malicious-Connection"`
+     - `connection.type = "802-3-ethernet"` (or wifi, depending on context)
+     - `connection.autoconnect = true`
+
+3. **Send D‑Bus METHOD_CALL with controlled `DESTINATION`:**
+   - The attacker constructs a `METHOD_CALL` to:
+     - `PATH = "/org/freedesktop/NetworkManager"`
+     - `INTERFACE = "org.freedesktop.NetworkManager"`
+     - `MEMBER = "AddConnection"`
+     - `DESTINATION = "org.freedesktop.NetworkManager"`
+     - `SIGNATURE = "a{sa{sv}}"` (single argument: a dict of string → dict(string → variant))
+   - Because `DESTINATION` is set to `org.freedesktop.NetworkManager`, the message bus routes the call **directly and exclusively** to the NetworkManager daemon, regardless of any match rules.  
+   - If `DESTINATION` were *not* set to this value (e.g., left empty or set to some non‑existent or benign name), the bus would:
+     - Not deliver the message to NetworkManager, or
+     - Deliver it as a broadcast where NetworkManager does not match it, resulting in no effect.
+   - Thus, the ability to set `DESTINATION` to this specific well‑known name is **critical** to reach the privileged service at all.
+
+4. **Polkit authorization and sandbox bypass:**
+   - NetworkManager receives the `AddConnection` call and consults polkit to decide if the caller (the real user identity outside the sandbox) is authorized to add a connection.
+   - Under typical desktop polkit rules:
+     - An active local session user is permitted to add or modify “own” connections without an additional password prompt or with a prompt that the user implicitly trusts as part of the sandboxed app.
+   - Because the sandboxed app runs as that user, the polkit check succeeds.
+   - The sandbox’s intention (e.g., “no network reconfiguration from inside the Flatpak”) is **bypassed**, since it did not constrain the `DESTINATION` field; D‑Bus still regards the call as coming from a trusted user process.
+
+5. **Impact:**
+   - Once the malicious connection is added and (optionally) activated, the attacker’s profile can:
+     - Change the system’s DNS to an attacker‑controlled server → **network‑wide DNS hijacking / MITM** for the user’s traffic, including HTTPS if combined with further attacks.
+     - Modify routing to redirect traffic to attacker‑controlled gateways or local proxies.
+     - Disrupt or deny network connectivity (DoS).
+   - This is a **security‑relevant effect**: the attacker gains control over the victim’s network configuration despite the supposed isolation guarantees of the sandbox.  
+   - The attack fundamentally hinges on controlling `DESTINATION`; a sandbox that strips or rewrites `DESTINATION` to a non‑sensitive name (or blocks `org.freedesktop.NetworkManager`) would prevent the message from reaching NetworkManager, and the attack would fail.
+
+---
+
+**Attack Message:**
+
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": "METHOD_CALL",
+    "flags": 0,
+    "protocol_version": 1,
+    "serial": 42
+  },
+  "header_fields": {
+    "PATH": "/org/freedesktop/NetworkManager",
+    "INTERFACE": "org.freedesktop.NetworkManager",
+    "MEMBER": "AddConnection",
+    "DESTINATION": "org.freedesktop.NetworkManager",
+    "SIGNATURE": "a{sa{sv}}"
+  },
+  "body": {
+    "0": {
+      "connection": {
+        "id": { "type": "s", "value": "Malicious-Connection" },
+        "type": { "type": "s", "value": "802-3-ethernet" },
+        "autoconnect": { "type": "b", "value": true }
+      },
+      "ipv4": {
+        "method": { "type": "s", "value": "manual" },
+        "address-data": {
+          "type": "aa{sv}",
+          "value": [
+            {
+              "address": { "type": "s", "value": "192.0.2.10" },
+              "prefix": { "type": "u", "value": 24 }
+            }
+          ]
+        },
+        "gateway": { "type": "s", "value": "192.0.2.1" },
+        "dns": {
+          "type": "au",
+          "value": [ "198.51.100.53" ]
+        }
+      },
+      "ipv6": {
+        "method": { "type": "s", "value": "ignore" }
+      }
+    }
+  },
+  "_exploit_context": {
+    "description": "This METHOD_CALL reconfigures the host's networking by adding a NetworkManager connection with attacker-controlled DNS and routing. The exploit critically depends on DESTINATION='org.freedesktop.NetworkManager' so that the system bus unicast-routes the message to the privileged NetworkManager daemon. Sandboxes like Flatpak document that unrestricted system-bus access to org.freedesktop.NetworkManager breaks their security guarantees.",
+    "references": [
+      "https://dbus.freedesktop.org/doc/dbus-specification.html#message-protocol-header-fields",
+      "https://dbus.freedesktop.org/doc/dbus-specification.html#message-bus-routing",
+      "https://networkmanager.dev/docs/api/latest/NetworkManager.html#org.freedesktop.NetworkManager.AddConnection",
+      "https://docs.flatpak.org/en/latest/sandbox-permissions.html#dbus-access"
+    ]
+  }
+}
+```
+
+---
+
+**Classification:** ATTACK

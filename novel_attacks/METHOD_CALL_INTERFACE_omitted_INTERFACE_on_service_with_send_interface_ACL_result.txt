@@ -1,0 +1,105 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Host: Typical Linux system with a system bus managed by `dbus-daemon`.
+  - A privileged service `com.example.Firewall1` runs as root on the system bus.
+    - Exports object `/com/example/Firewall1`.
+    - Implements interface `com.example.Firewall1.Control` with method `AddRule(s rule_spec)` that installs/removes firewall rules.
+  - `dbus-daemon` is configured with policy rules using `<allow send_interface="com.example.Firewall1.Control" ...>` to limit which users may invoke this interface. The default policy for messages that do *not* match any `send_interface` rule is permissive for this destination.
+  - The service is written using a common D‑Bus binding (e.g., GDBus, sd-bus, QtDBus) that:
+    - Dispatches incoming `METHOD_CALL`s based on path + member (and optionally interface).
+    - Will route a method call that omits the `INTERFACE` header to the unique matching method on that object (in this case `AddRule` on `/com/example/Firewall1`), if there is no ambiguity.
+- **Attacker Capability:**
+  - Local, unprivileged user with the ability to:
+    - Connect to the system bus.
+    - Send arbitrary `METHOD_CALL` messages to `com.example.Firewall1`.
+    - Fully control the `INTERFACE` header field value for those messages, including *omitting* it entirely.
+    - Control method arguments in the message body.
+
+**Attack Procedure:**
+1. **Understand the policy boundary:**
+   - `dbus-daemon` policy is written on the assumption that sensitive methods in `com.example.Firewall1` will always be invoked with `INTERFACE="com.example.Firewall1.Control"`.
+   - The policy uses `<allow send_interface="com.example.Firewall1.Control" ...>` to grant or deny access.
+   - Per the D‑Bus spec, `INTERFACE` is optional for `METHOD_CALL`s. The spec *explicitly warns* that ACLs that filter by interface **must also reject messages lacking INTERFACE**, or they can be bypassed.
+
+2. **Identify the attacker’s restriction:**
+   - The attacker’s user is not listed in the `send_interface="com.example.Firewall1.Control"` allow rules.
+   - If they send a call with `INTERFACE="com.example.Firewall1.Control"`, `dbus-daemon` correctly denies it:
+     - `destination = com.example.Firewall1`
+     - `path = /com/example/Firewall1`
+     - `interface = com.example.Firewall1.Control`
+     - `member = AddRule`
+   - This fails because the interface-level ACL triggers.
+
+3. **Exploit the optional INTERFACE field:**
+   - The attacker instead sends the *same* `METHOD_CALL` but **omits** the `INTERFACE` header entirely.
+   - Policy evaluation:
+     - The `send_interface="com.example.Firewall1.Control"` rules no longer match because there is no `INTERFACE` field.
+     - Due to misconfiguration (contrary to spec guidance), there is no complementary `<deny>` rule for `send_interface="*"` or for messages with missing INTERFACE.
+     - The message falls through to a default allow rule on the system bus or on this destination/path.
+   - The message passes through `dbus-daemon` despite the original intent to restrict `AddRule`.
+
+4. **Service-side dispatch misbehavior:**
+   - The D‑Bus binding in `com.example.Firewall1` receives a `METHOD_CALL`:
+     - `path=/com/example/Firewall1`
+     - `member=AddRule`
+     - No `INTERFACE` header.
+   - Common bindings (e.g., GDBus, sd-bus) are designed to:
+     - Route calls without an interface to the matching method if path+member uniquely identify it.
+   - As a result, the `AddRule` handler in `com.example.Firewall1.Control` is invoked as if the call had correctly specified `INTERFACE="com.example.Firewall1.Control"`.
+
+5. **Impact: privilege escalation via unauthorized firewall changes:**
+   - The attacker’s `AddRule` call executes with root privileges.
+   - By controlling the `rule_spec` argument, the attacker can:
+     - Add firewall rules that open arbitrary ports.
+     - Disable filtering or redirect traffic.
+     - Potentially expose internal services or facilitate further local/remote compromise.
+   - Crucially, if the attacker *does* supply `INTERFACE="com.example.Firewall1.Control"`, the method is blocked by `send_interface` policy; **the attack works *only* because the attacker can omit the INTERFACE header**.
+
+6. **Why other INTERFACE values don’t work:**
+   - If the attacker sets `INTERFACE` to any non-matching name:
+     - `dbus-daemon` might apply different `send_interface` rules, but the service binding will not match `com.example.Firewall1.Control.AddRule`, so the call is rejected or results in `org.freedesktop.DBus.Error.UnknownMethod`.
+   - The vulnerability specifically hinges on the ability to send a `METHOD_CALL` **with no INTERFACE field at all**, bypassing interface-based policy checks while still being dispatched by the service.
+
+**Attack Message:**
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": "METHOD_CALL",
+    "flags": 0,
+    "protocol_version": 1,
+    "serial": 42
+  },
+  "header_fields": {
+    "PATH": "/com/example/Firewall1",
+    "MEMBER": "AddRule",
+    "DESTINATION": "com.example.Firewall1",
+    "SIGNATURE": "s"
+    /* Note: INTERFACE field is intentionally omitted */
+  },
+  "body": {
+    "0": {
+      "name": "rule_spec",
+      "type": "s",
+      "value": "iptables -A INPUT -p tcp --dport 22 -j ACCEPT"
+    }
+  },
+  "_exploit_context": {
+    "bus": "system",
+    "security_profile": "ATTACK",
+    "vulnerability_mechanism": "Bypass of dbus-daemon send_interface ACLs via omission of INTERFACE on METHOD_CALL",
+    "why_interface_is_critical": [
+      "D-Bus spec: INTERFACE is optional on METHOD_CALL; ACLs matching on interface must also reject messages with no INTERFACE.",
+      "dbus-daemon policy uses <allow send_interface=\"com.example.Firewall1.Control\"> to gate access.",
+      "Service binding dispatches interface-less METHOD_CALL based on PATH+MEMBER to AddRule.",
+      "If INTERFACE=\"com.example.Firewall1.Control\" is present, policy blocks the call; omission of INTERFACE is what enables the bypass."
+    ],
+    "references": [
+      "D-Bus Specification: 'Header Fields' (INTERFACE) and 'Method Calls' sections",
+      "dbus-daemon.conf(5) policy docs: send_interface attribute and its security implications"
+    ]
+  }
+}
+```
+
+**Classification:** ATTACK

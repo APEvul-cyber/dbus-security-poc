@@ -1,0 +1,107 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Target platform: a standard Linux distribution using the system D‑Bus (`/usr/bin/dbus-daemon`), with typical system‑bus policies allowing unprivileged users to talk to certain root‑owned services.
+  - Target service: `com.example.PrivilegedConfig1`, a root‑running system daemon exposing configuration and secret material. It implements `org.freedesktop.DBus.Properties` on `/com/example/PrivilegedConfig1`, including `GetAll` (in `s` interface_name, out `a{sv}` props).
+  - Access control: a higher‑level ACL engine (e.g., PolicyKit‑like helper or an in‑house wrapper) applies rules keyed on the tuple `(interface, member, signature)` for each METHOD_CALL, and is misconfigured to protect `GetAll` only for the empty body signature `""` instead of the correct `GetAll(s)`.
+  - The underlying D‑Bus daemon is correctly enforcing standard bus policies and message well‑formedness as per the D‑Bus specification.
+- **Attacker Capability:**
+  - Local unprivileged user with permission to connect to the system bus.
+  - Can send arbitrary `METHOD_CALL` messages to `com.example.PrivilegedConfig1` (the bus policy does not block this interface/member), with full control over:
+    - the `SIGNATURE` header field (code 8), and
+    - the message body values consistent with that signature.
+  - Cannot directly modify the ACL engine configuration, cannot run code as root, and cannot bypass dbus-daemon’s type checking.
+
+---
+
+**Attack Procedure:**
+
+1. **Reconnaissance / Service Discovery**
+   - The attacker uses `gdbus introspect` or similar tooling on the system bus to discover `com.example.PrivilegedConfig1`:
+     - Path: `/com/example/PrivilegedConfig1`
+     - Interface: `org.freedesktop.DBus.Properties`
+     - Method: `GetAll` with signature `s` → `a{sv}`.
+   - Introspection or documentation shows that the daemon exposes security‑sensitive properties under internal interfaces such as:
+     - `com.example.PrivilegedConfig1.Secrets`
+     - `com.example.PrivilegedConfig1.InternalConfig`
+
+2. **ACL Behavior Inference**
+   - By trial, the attacker sends a `GetAll` METHOD_CALL without a body and with `SIGNATURE` set to the empty string `""`.
+   - The ACL engine has a misconfigured rule like:
+     - `(interface = "org.freedesktop.DBus.Properties", member = "GetAll", signature = "") → deny`
+   - The ACL engine correctly *denies* this malformed variant (even though the service’s real method doesn’t accept `""`).
+   - However, this reveals that the ACL engine is matching on `(interface, member, signature)` and that there is a mistake around the expected signature.
+
+3. **Exploit: Use the Correct Wire‑Level Signature to Bypass ACL**
+   - The attacker crafts a well‑formed call using the real D‑Bus method prototype:
+     - `SIGNATURE` header: `"s"`
+     - Body: a single STRING argument naming a sensitive internal interface, for example:
+       - `"com.example.PrivilegedConfig1.Secrets"`
+   - When this METHOD_CALL hits the policy/ACL engine:
+     - Tuple is `(org.freedesktop.DBus.Properties, GetAll, "s")`.
+     - No rule exists for this signature (only for `""`), so it is treated as unclassified/default‑allow.
+   - The ACL engine therefore allows the request to pass through to `com.example.PrivilegedConfig1`.
+
+4. **Service Response and Impact**
+   - The service sees a valid `GetAll(s)` call and, according to the `org.freedesktop.DBus.Properties` spec, returns all properties of the requested interface in an `a{sv}` dictionary.
+   - Sensitive contents may include:
+     - Credentials or tokens.
+     - Internal file paths (e.g., private key locations).
+     - Feature flags or protection bypass toggles.
+   - The unprivileged attacker receives this `a{sv}` reply and can:
+     - Exfiltrate secrets.
+     - Use internal configuration details to mount further attacks (e.g., targeting specific files, sockets, or environment assumptions).
+
+5. **Why Control Over `SIGNATURE` Is Exploit‑Critical**
+   - If the attacker were forced to use the misconfigured signature `""`:
+     - The ACL would match `(org.freedesktop.DBus.Properties, GetAll, "")` and deny the call before it reaches the service.
+     - Even if the daemon received such a call, D‑Bus type checking would reject an empty‑body `GetAll` as invalid for `GetAll(s)`.
+   - If the attacker uses any other incorrect signature (e.g., `"a{sv}"`, `"ss"`), the message either:
+     - Is blocked by the ACL (if rules exist for those signatures), or
+     - Is rejected/unmarshalled by the D‑Bus stack because it doesn’t match the method’s defined prototype.
+   - The attack *only* works because the attacker can set `SIGNATURE = "s"` and provide a correctly typed body so that:
+     - The ACL engine *fails* to match its protection rule (written for `""`), and
+     - The daemon accepts and executes the call exactly as intended.
+
+   In other words, the vulnerability is specifically about **signature‑sensitive access control**: the `SIGNATURE` header is the discriminator used by the policy layer, and the misbinding of the rule to the wrong signature transforms control over this field into a privilege‑bypassing capability.
+
+---
+
+**Attack Message:**
+
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": "METHOD_CALL",
+    "flags": 0,
+    "protocol_version": 1,
+    "serial": 42
+  },
+  "header_fields": {
+    "PATH": "/com/example/PrivilegedConfig1",
+    "INTERFACE": "org.freedesktop.DBus.Properties",
+    "MEMBER": "GetAll",
+    "DESTINATION": "com.example.PrivilegedConfig1",
+    "SIGNATURE": "s"
+  },
+  "body": [
+    {
+      "index": 0,
+      "type": "s",
+      "name": "interface_name",
+      "value": "com.example.PrivilegedConfig1.Secrets"
+    }
+  ],
+  "_exploit_context": {
+    "description": "The ACL engine is misconfigured to deny only (INTERFACE=\"org.freedesktop.DBus.Properties\", MEMBER=\"GetAll\", SIGNATURE=\"\") and has no rule for SIGNATURE=\"s\". By explicitly setting SIGNATURE=\"s\" and providing a single string argument, the attacker causes the call to bypass the ACL and be accepted as a legitimate GetAll(s) invocation, returning an a{sv} map containing privileged properties.",
+    "spec_references": [
+      "D-Bus Specification: Header Fields, SIGNATURE (code 8), requiring the field to describe the body and allowing empty body only if SIGNATURE is omitted.",
+      "D-Bus Specification: org.freedesktop.DBus.Properties.GetAll(in s interface_name) → a{sv}."
+    ]
+  }
+}
+```
+
+---
+
+**Classification:** ATTACK

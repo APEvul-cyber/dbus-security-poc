@@ -1,0 +1,123 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Typical modern Linux desktop or server with:
+    - System D‑Bus (`/usr/bin/dbus-daemon --system`).
+    - `udisksd` (UDisks2) running as root, exposing `org.freedesktop.UDisks2` on the system bus.
+    - PolicyKit (polkit) used to authorize privileged UDisks2 operations such as `org.freedesktop.UDisks2.Block.Format`.
+  - Admin or distro has installed a broad polkit rule to “let local users format disks” (examples like this are commonly shown in distro/admin documentation), but **the rule does not constrain which block device object paths are allowed**. It effectively says “interactive user may call `org.freedesktop.UDisks2.Block.Format` on any object.”
+  - This is a realistic misconfiguration: UDisks2 documentation and distro guides often show “allow formatting by active user” rules keyed only on the action ID, not on the D‑Bus object path.  
+    - For example, a polkit rule matching `org.freedesktop.udisks2.modify-device` or `org.freedesktop.udisks2.filesystem-modify-system` without `polkit.subject`/object path filtering.
+  - Attacker is an unprivileged local user on the same machine (e.g., normal desktop user account or user in `plugdev` / `storage` group).
+
+- **Attacker Capability:**
+  - Can connect to the system bus as their own user (default on Linux).
+  - Can send arbitrary D‑Bus `METHOD_CALL` messages to `org.freedesktop.UDisks2` with:
+    - Full control over the `PATH` header (OBJECT_PATH),
+    - Full control over `INTERFACE`, `MEMBER`, and method arguments (subject to type/signature),
+    - No ability to bypass polkit directly, but the polkit configuration is overly permissive and does **not** distinguish between “safe” and “sensitive” block device paths.
+  - In particular, the attacker can choose any path under `/org/freedesktop/UDisks2/block_devices/*`, including those corresponding to the **system disk**, e.g. `/org/freedesktop/UDisks2/block_devices/sda` for `/dev/sda`.
+
+
+**Attack Procedure:**
+
+1. **Enumerate UDisks2 block object paths:**
+   - The attacker runs (or conceptually runs) an unprivileged introspection:
+     - `gdbus introspect --system --dest org.freedesktop.UDisks2 --object-path /org/freedesktop/UDisks2`
+     - or `busctl tree org.freedesktop.UDisks2`
+   - They find that `/org/freedesktop/UDisks2/block_devices/sda` corresponds to the main system disk (`/dev/sda`), and similarly `/org/freedesktop/UDisks2/block_devices/sdb1` might be a removable USB stick.
+
+2. **Confirm broad polkit permission (or simply exploit it blind):**
+   - By calling `org.freedesktop.UDisks2.Block.Format` on a **removable** device path (e.g. `/org/freedesktop/UDisks2/block_devices/sdb1`), the attacker sees that:
+     - The call succeeds without prompting for admin authentication, or
+     - A polkit prompt appears and can be satisfied by the attacker’s own user credentials.
+   - This indicates that the local policy allows the attacker to issue `Block.Format` on at least some devices.
+   - Importantly, the policy matched only on the action ID (e.g. `org.freedesktop.udisks2.modify-device`) and did **not** restrict which `PATH` (which block device object) the call applies to.
+
+3. **Craft a malicious FORMAT call targeting the system disk:**
+   - Instead of targeting a removable drive (as intended by the administrator), the attacker now crafts a D‑Bus message:
+     - `PATH = /org/freedesktop/UDisks2/block_devices/sda`
+     - `INTERFACE = org.freedesktop.UDisks2.Block`
+     - `MEMBER = Format`
+     - `SIGNATURE = "sa{sv}"` (e.g. filesystem type string and options dictionary)
+   - Example body: type `"ext4"` and options `{ "erase": <true>, "label": "PWNED" }`.
+
+4. **Polkit evaluation and dispatch:**
+   - `udisksd` receives the `METHOD_CALL` and creates a polkit `Subject` and `Action` describing:
+     - Caller’s UID/session,
+     - The action ID corresponding to `org.freedesktop.UDisks2.Block.Format`,
+     - Object details including **the object path** `/org/freedesktop/UDisks2/block_devices/sda`.
+   - The polkit rule is misconfigured and checks only the action ID (or just “any block device”) but **ignores the object path subtree**, so it authorizes the call **even though the path points at the system disk**.
+
+5. **Root‑privileged destructive operation on the system disk:**
+   - Once authorized, `udisksd` runs the corresponding backend helper as root (e.g., `mkfs.ext4` via `udisksd`’s helpers) against `/dev/sda`.
+   - This formats the entire system disk or its root partition, causing:
+     - Immediate and irreversible data destruction (availability violation),
+     - Possible destruction of other users’ data,
+     - Potential loss of system integrity (e.g., if partially formatted while system is running, leading to undefined behavior, crashed services, possible subsequent exploitation during recovery).
+
+6. **Why PATH is critical, and other values would not trigger this impact:**
+   - If `PATH` were constrained (by policy or by the service) to only:
+     - `/org/freedesktop/UDisks2/block_devices` subtree for **removable** devices, or
+     - A specific user’s own encrypted volume object,
+     - then the same `Format` call would at worst destroy the attacker’s own removable media.
+   - The **only reason** the attacker can direct the operation at `/dev/sda` is because they can freely choose `PATH=/org/freedesktop/UDisks2/block_devices/sda`.  
+     That alters which Block object instance is bound to the method, and therefore which kernel block device the root‑privileged helper is executed against.
+   - If the attacker sent exactly the same message but with `PATH=/org/freedesktop/UDisks2/block_devices/sdb1` (a removable disk), the impact would be much less severe and aligned with admin intent. The vulnerability is the combination of:
+     - Attacker control over `PATH`, and
+     - Polkit not constraining that `PATH` to “safe” objects.
+
+   This makes control over the `PATH` header **security‑critical** in this scenario.
+
+
+**Attack Message:**
+
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": "METHOD_CALL",
+    "flags": 0,
+    "protocol_version": 1,
+    "serial": 42
+  },
+  "header_fields": {
+    "PATH": "/org/freedesktop/UDisks2/block_devices/sda",
+    "INTERFACE": "org.freedesktop.UDisks2.Block",
+    "MEMBER": "Format",
+    "DESTINATION": "org.freedesktop.UDisks2",
+    "REPLY_EXPECTED": true,
+    "SIGNATURE": "sa{sv}"
+  },
+  "body": {
+    "args": [
+      {
+        "name": "type",
+        "type": "s",
+        "value": "ext4"
+      },
+      {
+        "name": "options",
+        "type": "a{sv}",
+        "value": {
+          "erase": {
+            "type": "b",
+            "value": true
+          },
+          "label": {
+            "type": "s",
+            "value": "PWNED"
+          }
+        }
+      }
+    ]
+  },
+  "_exploit_context": {
+    "description": "Misconfigured polkit rule allows org.freedesktop.UDisks2.Block.Format for any block device without checking the D-Bus object path. By setting PATH=/org/freedesktop/UDisks2/block_devices/sda, the attacker causes udisksd (running as root) to run mkfs on /dev/sda (system disk) instead of a removable drive.",
+    "vulnerability_nature": "Authorization bypass via overly broad polkit policy; PATH header selects the privileged target object/device.",
+    "why_PATH_is_critical": "Changing PATH to a non-system device object (e.g., /org/freedesktop/UDisks2/block_devices/sdb1) limits damage to removable media. The ability to choose PATH=/org/freedesktop/UDisks2/block_devices/sda is what turns this into a system-wide destructive attack."
+  }
+}
+```
+
+
+**Classification:** ATTACK

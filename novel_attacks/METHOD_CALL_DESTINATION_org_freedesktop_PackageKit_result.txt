@@ -1,0 +1,133 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Target: A typical Linux desktop or workstation using the `system` D‑Bus, with `PackageKit` installed and enabled (e.g., Fedora, RHEL, Debian/Ubuntu derivatives).
+  - The `org.freedesktop.PackageKit` daemon is running as root on the system bus and exposes high‑privilege interfaces such as `org.freedesktop.PackageKit.Modify.InstallPackageFiles`.
+  - Standard D‑Bus policy allows any local user to send method calls *to* `org.freedesktop.PackageKit`; fine‑grained access to individual methods is enforced via Polkit actions defined in `/usr/share/polkit-1/actions/org.freedesktop.packagekit.policy`.
+  - A realistic but dangerous configuration is present, for example:
+    - A local Polkit rule that allows users in some group (e.g., `plugdev`, `students`, or a custom maintenance group) to perform non‑interactive local package installation using PackageKit (e.g., `auth_admin_keep` → changed to `yes` or `auth_self_keep` for `org.freedesktop.packagekit.system-install-packages` / `org.freedesktop.packagekit.package-install` actions).
+    - Or, more generally, any misconfigured or overly permissive Polkit rule that grants local users automatic authorization for `org.freedesktop.PackageKit.Modify.InstallPackageFiles`.
+  - No additional local privilege is assumed beyond:
+    - Being able to log in as an unprivileged user.
+    - Being able to write files in the user’s home directory (to store a malicious `.rpm`/`.deb`).
+
+- **Attacker Capability:**
+  - The attacker can open a client connection to the system D‑Bus (standard for logged‑in local users).
+  - The attacker can send arbitrary `METHOD_CALL` messages on that connection and fully control:
+    - The `DESTINATION` header field.
+    - The `PATH`, `INTERFACE`, `MEMBER`, and `SIGNATURE` header fields.
+    - The method arguments (body).
+  - In particular, the attacker can set `DESTINATION` to `org.freedesktop.PackageKit` so the bus routes the call directly to the root‑privileged PackageKit daemon, rather than to a benign peer or the bus itself.
+
+---
+
+**Attack Procedure:**
+
+1. **Prepare malicious package:**
+   - The attacker creates a native package (`evil.rpm` or `evil.deb`) whose maintainer scripts (e.g., `postinst`, `%post`) perform arbitrary privileged actions, such as:
+     - Dropping a setuid root shell in `/usr/local/bin/rootshell`.
+     - Adding a new user to the `sudo` group and/or modifying `/etc/sudoers`.
+     - Installing a backdoor service started as root.
+   - The package is written to a location controlled by the attacker, e.g.:
+     - `/home/attacker/evil.deb`
+
+2. **Rely on permissive Polkit configuration:**
+   - The target system’s `/usr/share/polkit-1/actions/org.freedesktop.packagekit.policy` and any supplementary rules in `/etc/polkit-1/rules.d/` or `/var/lib/polkit-1/localauthority/` are configured so that:
+     - The Polkit actions associated with `InstallPackageFiles` (e.g., `org.freedesktop.packagekit.package-install`, `org.freedesktop.packagekit.system-install-packages`) are authorized for the attacker’s user or group *without* requiring an administrator password or interactive confirmation.
+   - This is a realistic misconfiguration seen in practice when administrators relax package‑management checks for certain users, service accounts, test environments, or kiosk systems.
+
+3. **Craft the malicious D‑Bus `METHOD_CALL`:**
+   - The attacker sends a D‑Bus message on the **system** bus with:
+     - `DESTINATION=org.freedesktop.PackageKit`  
+       → This is the critical field that causes the message to be routed to the privileged PackageKit daemon.
+     - `PATH=/org/freedesktop/PackageKit`
+     - `INTERFACE=org.freedesktop.PackageKit.Modify`
+     - `MEMBER=InstallPackageFiles`
+   - The body includes the malicious package file path as a method argument, following the documented PackageKit API (exact signature variants differ across versions; conceptually it includes a list of files to install).
+
+   Example high‑level call (not final JSON yet):
+
+   ```text
+   METHOD_CALL
+   DESTINATION = "org.freedesktop.PackageKit"
+   PATH        = "/org/freedesktop/PackageKit"
+   INTERFACE   = "org.freedesktop.PackageKit.Modify"
+   MEMBER      = "InstallPackageFiles"
+   BODY        = {
+       transaction_flags: <some flags>,
+       files: ["file:///home/attacker/evil.deb"],
+       interaction: "none"
+   }
+   ```
+
+4. **Routing and authorization:**
+   - The system D‑Bus examines the `DESTINATION` header:
+     - Since `DESTINATION` matches the well‑known name owned by the PackageKit daemon, the bus routes the message *specifically* to that root‑privileged service.
+     - If `DESTINATION` were instead omitted or set to some other value:
+       - The method would not be delivered to `org.freedesktop.PackageKit`.
+       - Either no recipient would exist, the bus itself would reject it, or some unrelated non‑privileged service would see it, and **no package installation would occur**.
+   - PackageKit receives the message and asks Polkit whether the caller (identified by its unique bus name and credentials) is authorized to perform the requested action.
+     - Due to the misconfigured Polkit rules, the check returns `yes` without further user interaction.
+
+5. **Privilege escalation via root‑level installation:**
+   - PackageKit proceeds to install the provided local package file as root.
+   - The maintainer scripts inside `evil.deb` / `evil.rpm` are executed with full root privileges, as is standard for normal package installation.
+   - The malicious script, for instance, drops a setuid root shell at `/usr/local/bin/rootshell`.
+   - The attacker then simply runs `/usr/local/bin/rootshell` and obtains a root shell.
+
+6. **Why `DESTINATION` control is exploit‑critical:**
+   - The actual *privileged* code path that installs packages and executes maintainer scripts lives inside the `org.freedesktop.PackageKit` daemon.
+   - The only way for an unprivileged process to reach that code path is to send a D‑Bus message *addressed* to that service’s well‑known name.
+   - If the attacker could not set `DESTINATION=org.freedesktop.PackageKit`:
+     - The bus would not route the request to PackageKit.
+     - Polkit’s PackageKit actions would never be evaluated.
+     - The install operation (and thus execution of malicious maintainer scripts) would not occur.
+   - Therefore, attacker control over the `DESTINATION` field is directly responsible for steering the message into the privileged PackageKit context where the misconfigured Polkit policy becomes exploitable.
+
+---
+
+**Attack Message:**
+
+Below is an example attack packet expressed as a JSON representation of a D‑Bus `METHOD_CALL` message. The exact body fields and signature may vary between PackageKit versions, but this illustrates the structure and shows how `DESTINATION` is central to the attack.
+
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": "METHOD_CALL",
+    "flags": [],
+    "protocol_version": 1,
+    "serial": 42
+  },
+  "header_fields": {
+    "PATH": "/org/freedesktop/PackageKit",
+    "INTERFACE": "org.freedesktop.PackageKit.Modify",
+    "MEMBER": "InstallPackageFiles",
+    "DESTINATION": "org.freedesktop.PackageKit",
+    "SIGNATURE": "ua{sv}as"
+  },
+  "body": {
+    "transaction_flags": 0,
+    "options": {
+      "only-trusted": false,
+      "interaction": "none"
+    },
+    "files": [
+      "file:///home/attacker/evil.deb"
+    ]
+  },
+  "_exploit_context": {
+    "description": "This METHOD_CALL is routed to the root-running PackageKit daemon because DESTINATION is set to 'org.freedesktop.PackageKit'. A permissive or misconfigured Polkit rule for org.freedesktop.PackageKit.* actions allows the caller to install an arbitrary local package, executing its maintainer scripts as root and enabling full system compromise.",
+    "references": [
+      "D-Bus Specification: header field DESTINATION (code 6) and message bus routing behavior",
+      "/usr/share/polkit-1/actions/org.freedesktop.packagekit.policy (distribution PackageKit policy file)",
+      "Typical admin/custom Polkit rules that set 'yes' or overly broad 'auth_self_keep' for PackageKit install actions"
+    ]
+  }
+}
+```
+
+Note: Setting `DESTINATION` to any other name (or omitting it) would prevent the system bus from delivering this call to `org.freedesktop.PackageKit`, and thus the privileged installation and root‑level maintainer script execution would not occur.
+
+---
+
+**Classification:** ATTACK

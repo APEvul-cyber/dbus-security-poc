@@ -1,0 +1,114 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Target is a typical Linux system (desktop or server) running `org.freedesktop.UDisks2` on the *system* bus. UDisks2 runs as root and uses Polkit to authorize privileged operations.
+  - The UDisks2 D-Bus API is present with the `org.freedesktop.UDisks2.Block` interface and the `Format` method, as documented in UDisks2 upstream.
+  - Polkit policies are *not* the strict upstream defaults, but a realistic deployment in which:
+    - An admin, vendor, or custom distribution has installed permissive Polkit rules for UDisks2, for example a rule that grants `yes` for all methods on `org.freedesktop.UDisks2.Block` to local users (e.g., to “simplify” removable disk management).
+    - Or a buggy Polkit rule matches on the interface alone (or a broad action like `org.freedesktop.udisks2.*`) without discriminating the method name, unintentionally covering `Block.Format`.
+  - The attacker is an unprivileged local user on the system (e.g., a normal desktop account with access to the system bus).
+
+- **Attacker Capability:**
+  - The attacker can send arbitrary D-Bus `METHOD_CALL` messages on the system bus to `org.freedesktop.UDisks2`, including:
+    - Full control over the `MEMBER` header field (the method name).
+    - Control over method arguments (filesystem type, options dict).
+    - Ability to choose any block device object path that is visible via UDisks2 (e.g., `/org/freedesktop/UDisks2/block_devices/sdb`).
+  - The attacker cannot directly modify Polkit rules during the attack; they rely on the existing permissive/misconfigured rule that fails to restrict dangerous methods by member name.
+
+---
+
+**Attack Procedure:**
+
+1. **Reconnaissance and Introspection**
+   - The attacker uses D-Bus introspection (or the UDisks2 documentation) to discover:
+     - The block device object paths, e.g. `/org/freedesktop/UDisks2/block_devices/sdb`.
+     - The `org.freedesktop.UDisks2.Block` interface.
+     - The `Format` method with signature `sa{sv}` (string filesystem type, options dictionary).
+   - They also examine Polkit rules in `/usr/share/polkit-1/actions/org.freedesktop.UDisks2.policy` and `/etc/polkit-1/rules.d/*.rules`.  
+     A realistic misconfiguration looks like:
+
+     ```js
+     polkit.addRule(function(action, subject) {
+       if (action.id.indexOf("org.freedesktop.UDisks2") == 0 &&
+           subject.isInGroup("plugdev")) {
+         return polkit.Result.YES;   // BUG: no method-specific check
+       }
+     });
+     ```
+
+     This rule effectively authorizes *all* UDisks2 methods, including `Block.Format`, whenever the caller is in `plugdev` (or some local group).
+
+2. **Polkit Behavior with `MEMBER='Format'`**
+   - When the attacker sends a `METHOD_CALL` with:
+     - `INTERFACE="org.freedesktop.UDisks2.Block"`
+     - `PATH="/org/freedesktop/UDisks2/block_devices/sdb"`
+     - `MEMBER="Format"`
+   - UDisks2’s dispatch logic:
+     - Routes the call based on the `MEMBER` field (method name).
+     - Performs a Polkit authorization check specifically tied to the method being invoked. Many deployments model policy in terms of method-level actions (e.g., `org.freedesktop.udisks2.filesystem-format` or rules matching `Block.Format`).
+   - Because the misconfigured rule over-approves all UDisks2 actions based on interface or a coarse action ID, the authorization check for `Block.Format` incorrectly succeeds.
+
+3. **Destructive Formatting of a Device**
+   - The attacker crafts a `Format` request targeting a chosen device, e.g. a secondary data disk or even the main system disk if UDisks2 allows it:
+
+     - `filesystem_type = "ext4"`  
+     - `options = { "label": "PWNED", "erase": true }`  
+
+   - UDisks2, running as root, proceeds to:
+     - Wipe existing data structures on `/dev/sdb`.
+     - Create a fresh filesystem, destroying all previous content.
+
+   - This can result in:
+     - **Data destruction / sabotage** of another user’s or the system’s data.
+     - Potential **denial-of-service** if a system-critical disk or partition is formatted.
+     - In more advanced scenarios, the attacker may format a removable disk with a crafted filesystem that will later be auto-mounted with unsafe options (e.g. `uid=0`, suid binaries), enabling further escalation when another component interacts with it.
+
+4. **Why `MEMBER` is the Critical Field**
+   - The vulnerability hinges specifically on the ability to select the `Format` method via the `MEMBER` field:
+     - If the same message used `MEMBER="GetProperties"` or `MEMBER="OpenForPooling"`, the Polkit misconfiguration might still allow the call, but the operation would be read-only or non-destructive.
+     - It is the method name `Format` in `MEMBER` that makes UDisks2 execute a **destructive, privileged** operation (wiping and reinitializing the block device).
+   - Polkit rules and UDisks2’s own dispatch are method-oriented; the authorization logic is typically keyed on the combination of interface and method. By controlling `MEMBER`, the attacker chooses which policy entry and which code path is used:
+     - A permissive rule like “allow all on org.freedesktop.UDisks2.Block” effectively becomes catastrophic because the attacker can set `MEMBER="Format"`.
+   - Therefore, arbitrary control of the `MEMBER` value is directly security-critical whenever the destination service exposes privileged methods gated mainly by method name, as UDisks2 does.
+
+---
+
+**Attack Message:**
+
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": "METHOD_CALL",
+    "flags": 0,
+    "protocol_version": 1,
+    "serial": 42
+  },
+  "header_fields": {
+    "PATH": "/org/freedesktop/UDisks2/block_devices/sdb",
+    "INTERFACE": "org.freedesktop.UDisks2.Block",
+    "MEMBER": "Format",
+    "DESTINATION": "org.freedesktop.UDisks2",
+    "SIGNATURE": "sa{sv}"
+  },
+  "body": [
+    "ext4",
+    {
+      "label": { "type": "s", "value": "PWNED" },
+      "erase": { "type": "b", "value": true },
+      "take-ownership": { "type": "b", "value": true }
+    }
+  ],
+  "_exploit_context": {
+    "description": "Invokes the high-privilege Block.Format method on /dev/sdb via UDisks2. A misconfigured Polkit rule that authorizes org.freedesktop.UDisks2.* or all org.freedesktop.UDisks2.Block methods allows this call from an unprivileged user, causing data destruction on the target disk. The critical factor is MEMBER='Format'; other MEMBER values would not trigger the destructive behavior.",
+    "references": [
+      "D-Bus Specification: Header Fields and Method Calls – MEMBER field controls method dispatch.",
+      "UDisks2 Documentation: org.freedesktop.UDisks2.Block.Format creates a new filesystem on the device, wiping existing data.",
+      "Typical Polkit policy file: org.freedesktop.UDisks2.policy – method-specific actions are expected; overly broad rules create this vulnerability."
+    ]
+  }
+}
+```
+
+---
+
+**Classification:** ATTACK

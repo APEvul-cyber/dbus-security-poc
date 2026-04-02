@@ -1,0 +1,96 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Target is a typical Linux system using the standard system message bus (`dbus-daemon` or `dbus-broker`) running as root.
+  - The system bus exposes the standard `org.freedesktop.DBus.*` interfaces on the object `/org/freedesktop/DBus`, including `org.freedesktop.DBus.Peer` as specified by the D‑Bus spec.
+  - Any local, authenticated user can connect to the system bus and is generally allowed to call `org.freedesktop.DBus.Peer.Ping` without special privileges (no fine-grained policy is normally applied to this no-op liveness check).
+  - No special hardening (like external rate limiting of `Peer.Ping`) is in place; the bus follows standard freedesktop.org behavior.
+
+- **Attacker Capability:**
+  - The attacker is an unprivileged local user who can:
+    - Open a connection to the system D‑Bus.
+    - Send arbitrary `METHOD_CALL` messages to `DESTINATION=org.freedesktop.DBus`, `PATH=/org/freedesktop/DBus`.
+    - Fully control the `INTERFACE` header field (code 2, type STRING) in those calls, including setting it to `org.freedesktop.DBus.Peer` while also choosing the method member (`Ping`).
+  - The attacker can send these messages at a very high rate (tight loop, multiple processes, or multiple connections).
+
+---
+
+**Attack Procedure:**
+
+1. **Connect to the system bus:**
+   - The attacker uses `dbus-daemon`’s standard authentication (e.g., EXTERNAL) to establish a normal, unprivileged client connection to the system bus.
+   - This requires no special privileges beyond being a local user.
+
+2. **Craft `METHOD_CALL` messages targeting the Peer interface:**
+   - For each request, the attacker constructs a D‑Bus message with:
+     - `PATH=/org/freedesktop/DBus`
+     - `DESTINATION=org.freedesktop.DBus`
+     - `INTERFACE=org.freedesktop.DBus.Peer`
+     - `MEMBER=Ping`
+     - `SIGNATURE=""` (no body arguments)
+   - The critical control here is over **`INTERFACE`**, which selects the standard `org.freedesktop.DBus.Peer` interface that:
+     - Is guaranteed to exist on the bus daemon.
+     - Implements `Ping` with no arguments and no semantics beyond requiring a normal `METHOD_RETURN`.
+
+3. **High-rate flood of `Peer.Ping`:**
+   - The attacker sends these `METHOD_CALL`s in a tight loop over one or more connections.
+   - For each message, the root‑owned bus must:
+     - Parse the incoming message (headers including `INTERFACE`).
+     - Dispatch it to the `org.freedesktop.DBus.Peer` implementation bound to `/org/freedesktop/DBus`.
+     - Allocate and enqueue a `METHOD_RETURN` message with no payload back to the attacker’s connection.
+   - Because `Peer.Ping` is explicitly designed to be a cheap liveness check, it is intentionally made widely available and typically not rate-limited or strongly filtered by policy.
+
+4. **Resource exhaustion and denial of service:**
+   - Under sustained high-rate traffic, the bus:
+     - Consumes CPU performing parse/dispatch/reply work.
+     - Allocates internal data structures for replies and potentially fills internal queues or kernel socket buffers.
+   - Other D‑Bus clients on the system (e.g., NetworkManager, systemd, desktop services) experience:
+     - Increased latency.
+     - Timeouts or dropped connections if the bus becomes overloaded or unresponsive.
+   - This constitutes a **local DoS against a central privileged system component**, impacting system functionality for all users.
+
+5. **Why `INTERFACE` is critical:**
+   - The vulnerability is not a bug in the `Ping` implementation but a design/path-of-least-resistance issue:
+     - Setting `INTERFACE=org.freedesktop.DBus.Peer` ensures that the method is:
+       - Implemented by the bus itself (no need for a specific application to be present).
+       - Allowed for unprivileged users (since it is a standard liveness check).
+     - Using a different `INTERFACE` value:
+       - Might not match any implemented interface, causing an immediate `UnknownInterface` error, often cheaper to handle and sometimes rate-limited or policy-denied.
+       - Might require additional authorization via the bus policy.
+   - Thus, the **attacker’s control over the `INTERFACE` header** is what lets them reliably select `org.freedesktop.DBus.Peer` as a **universally present, cheap-to-call, privileged-bus-handled** interface, turning simple message flooding into a focused DoS vector against the root-run system bus.
+
+---
+
+**Attack Message:**
+
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": 1,
+    "flags": 0,
+    "protocol_version": 1,
+    "serial": 42
+  },
+  "header_fields": {
+    "PATH": "/org/freedesktop/DBus",
+    "INTERFACE": "org.freedesktop.DBus.Peer",
+    "MEMBER": "Ping",
+    "DESTINATION": "org.freedesktop.DBus",
+    "SIGNATURE": ""
+  },
+  "body": [],
+  "_exploit_context": {
+    "description": "Flood of org.freedesktop.DBus.Peer.Ping on /org/freedesktop/DBus to the system bus. The INTERFACE='org.freedesktop.DBus.Peer' value is crucial: it selects the standard Peer interface that the bus must implement for any peer and typically allows unprivileged access. This forces the root-owned bus to parse, dispatch, and generate METHOD_RETURN replies for each request, enabling CPU and queue exhaustion without any special privileges.",
+    "spec_references": [
+      "https://dbus.freedesktop.org/doc/dbus-specification.html#message-protocol-header-fields",
+      "https://dbus.freedesktop.org/doc/dbus-specification.html#standard-interfaces-peer"
+    ]
+  }
+}
+```
+
+In practice, the attacker would send this message repeatedly (potentially across multiple connections and processes) to maximize load on the bus daemon.
+
+---
+
+**Classification:** ATTACK

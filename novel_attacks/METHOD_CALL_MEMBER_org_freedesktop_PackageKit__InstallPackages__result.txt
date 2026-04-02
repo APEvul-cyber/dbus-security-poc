@@ -1,0 +1,107 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Target: A standard Linux desktop or server using the system bus, with `PackageKit` installed and enabled (e.g., Fedora, Ubuntu, Debian derivatives).
+  - Service: `org.freedesktop.PackageKit` running as `root` on the system D‑Bus.
+  - Policy: There exists either
+    - a misconfigured or overly permissive polkit rule (e.g., granting `org.freedesktop.packagekit.package-install` to any active local user without authentication), or  
+    - a polkit/PackageKit policy bug that effectively allows unprivileged local users to call `InstallPackages` on a transaction object.
+  - The D‑Bus router and `PackageKit` behave as specified by freedesktop.org: the `MEMBER` header determines which method implementation within `org.freedesktop.PackageKit.Transaction` is executed.
+  - No other application‑level bugs (e.g., memory corruption) are assumed; the “vulnerability” is the incorrect authorization boundary around a privileged method.
+- **Attacker Capability:**
+  - Local unprivileged user with access to the system bus (standard on multi‑user Linux).
+  - Can send arbitrary `METHOD_CALL` messages to `org.freedesktop.PackageKit` with full control over:
+    - `PATH` (once a transaction object path is obtained),
+    - `INTERFACE = org.freedesktop.PackageKit.Transaction`,
+    - `MEMBER` (the field under study),
+    - `DESTINATION = org.freedesktop.PackageKit`,
+    - and all method arguments (message body).
+  - The attacker’s **extra** capability relative to a benign user is: polkit rules (or their misconfiguration) do not correctly restrict calls where `MEMBER = InstallPackages`.
+
+---
+
+**Attack Procedure:**
+
+1. **Create or obtain a transaction object path:**
+   - The attacker first calls `org.freedesktop.PackageKit.CreateTransaction` (often allowed without strong restrictions) to obtain a new transaction object path, e.g. `/org/freedesktop/PackageKit/Transactions/1`.
+   - This is a relatively low‑risk operation in normal designs; many systems allow regular users to create PackageKit transactions for read‑only operations (e.g., checking for updates).
+
+2. **Select the privileged code path via `MEMBER = InstallPackages`:**
+   - On the transaction object, `org.freedesktop.PackageKit.Transaction` exposes multiple members, such as:
+     - `GetDetails` (read package metadata),
+     - `GetUpdates` (query updates),
+     - `InstallPackages` (perform package installation as root).
+   - The **only difference in the D‑Bus header** between a harmless metadata query and a high‑impact privileged operation is the `MEMBER` field.  
+     - `MEMBER = GetDetails` → harmless read‑only query.  
+     - `MEMBER = InstallPackages` → execution of privileged package installation logic.
+   - Because the polkit policy is misconfigured/overly permissive, the authorization check associated with the action `org.freedesktop.packagekit.package-install` is incorrectly satisfied (e.g., “any active local user” or due to a specific buggy rule), so the call is allowed.
+
+3. **Craft a malicious package installation request:**
+   - The attacker prepares one or more package IDs that point to attacker‑controlled or attacker‑chosen packages, for example:
+     - A local package that contains a post‑install script (`%post` in RPM, `postinst` in dpkg) that executes arbitrary commands as `root` (adding a new sudo user, dropping a setuid shell, etc.).
+   - The attacker then sends a `METHOD_CALL`:
+     - `PATH = /org/freedesktop/PackageKit/Transactions/1`
+     - `INTERFACE = org.freedesktop.PackageKit.Transaction`
+     - `MEMBER = InstallPackages`
+     - with arguments encoding:
+       - installation flags,
+       - the array of package IDs,
+       - interaction mode.
+
+4. **Service behavior and privilege escalation:**
+   - `PackageKit` receives the message and dispatches **only based on** the interface and `MEMBER`:
+     - It recognizes `MEMBER = InstallPackages` and enters the code path that:
+       - Downloads/reads the provided package(s),
+       - Invokes the underlying system package manager (e.g., `dnf`, `apt`, `zypper`) as `root`,
+       - Runs any maintainer scripts inside the package with full root privileges.
+   - Because the polkit policy erroneously allowed the method call, the attacker’s package script runs as `root`, providing a straightforward privilege escalation.
+   - If the same attacker had sent exactly the same message but with `MEMBER = GetDetails` (or another non‑privileged method name), `PackageKit` would only return metadata and **no privileged code path would be triggered**. This demonstrates that the attacker’s control over `MEMBER` is what switches the operation from benign to dangerous.
+
+5. **Post‑exploitation:**
+   - The attacker’s install script can:
+     - Create a new admin user and add it to `sudo` or `wheel`,
+     - Drop a setuid root shell in `/usr/local/bin`,
+     - Modify security‑sensitive configuration files,
+     - Install persistent backdoors.
+   - After the transaction completes, the attacker has a durable root foothold.
+
+---
+
+**Attack Message:**
+
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": "METHOD_CALL",
+    "flags": 0,
+    "protocol_version": 1,
+    "serial": 42
+  },
+  "header_fields": {
+    "PATH": "/org/freedesktop/PackageKit/Transactions/1",
+    "INTERFACE": "org.freedesktop.PackageKit.Transaction",
+    "MEMBER": "InstallPackages",
+    "DESTINATION": "org.freedesktop.PackageKit",
+    "SIGNATURE": "uas"
+  },
+  "body": {
+    "transaction_flags": 0,
+    "package_ids": [
+      "evil-rootkit;1.0;amd64;file:/home/attacker/evil-rootkit-1.0-1.amd64.rpm"
+    ],
+    "interaction": "none"
+  },
+  "_exploit_context": {
+    "why_MEMBER_is_critical": "Changing MEMBER from 'InstallPackages' to a benign method like 'GetDetails' causes PackageKit to execute only read-only metadata queries instead of invoking the privileged package installation path. The polkit action guarding InstallPackages (e.g., org.freedesktop.packagekit.package-install) is misconfigured/overly permissive, so attacker control of MEMBER is sufficient to reach a root-level code path.",
+    "references": [
+      "D-Bus specification: MEMBER header field defines which method is invoked for METHOD_CALL messages.",
+      "PackageKit docs: org.freedesktop.PackageKit.Transaction.InstallPackages performs package installation via the system package manager as root.",
+      "polkit docs: authorization for org.freedesktop.packagekit.package-install controls access to this privileged method; misconfigured rules can grant it to unprivileged users."
+    ]
+  }
+}
+```
+
+---
+
+**Classification:** ATTACK

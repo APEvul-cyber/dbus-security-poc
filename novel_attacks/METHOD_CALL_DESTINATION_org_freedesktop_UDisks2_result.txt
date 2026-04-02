@@ -1,0 +1,84 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Target platform: a modern Linux distribution (e.g., Fedora, Ubuntu) running a system D‑Bus and the `udisks2` package.
+  - `udisksd` runs as root on the system bus, exporting `org.freedesktop.UDisks2` with methods such as `Filesystem.Mount` that perform privileged storage operations, guarded by D‑Bus policy and Polkit.
+  - A sandbox/container mechanism (for example, a custom container runtime or a misconfigured Flatpak‑like environment) shares the *host system bus* with sandboxed processes but tries to restrict what D‑Bus traffic they can send.
+  - The sandbox’s policy mistakenly constrains only PATH/INTERFACE/MEMBER (or checks “safe” interfaces) and does **not** correctly restrict the `DESTINATION` header field, so untrusted code inside the sandbox can choose arbitrary bus names as DESTINATION.
+  - Outside the sandbox, the host is otherwise correctly configured; there is no need to assume a buggy `udisks2` implementation, only its documented behavior (mounting devices as root for an authorized caller).
+
+- **Attacker Capability:**
+  - The attacker controls an unprivileged process inside the sandbox/container.
+  - That process can send arbitrary D‑Bus `METHOD_CALL` messages onto the *host system bus*, with full control over:
+    - `DESTINATION` (the bus name that receives the call),
+    - PATH, INTERFACE, MEMBER, and method arguments.
+  - The sandbox does *not* intend to allow direct interaction with privileged system services like `org.freedesktop.UDisks2`, but due to the bug, it cannot prevent the attacker from setting `DESTINATION=org.freedesktop.UDisks2`.
+
+---
+
+**Attack Procedure:**
+
+1. **Identify a privileged target service and object:**
+   - The attacker knows (from documentation) that `org.freedesktop.UDisks2` provides privileged disk management. Its documentation states that `Filesystem.Mount` on objects under `/org/freedesktop/UDisks2/block_devices/*` causes `udisksd` (running as root) to perform a `mount(2)` on the host.
+   - Using standard D‑Bus introspection (or prior knowledge of device paths), the attacker finds a suitable block device object such as `/org/freedesktop/UDisks2/block_devices/sda1`.
+
+2. **Craft a `Filesystem.Mount` call with a malicious DESTINATION:**
+   - From inside the sandbox, the attacker constructs a `METHOD_CALL`:
+     - PATH = `/org/freedesktop/UDisks2/block_devices/sda1`
+     - INTERFACE = `org.freedesktop.UDisks2.Filesystem`
+     - MEMBER = `Mount`
+     - SIGNATURE = `a{sv}` (options dictionary)
+   - Crucially, the attacker sets:
+     - `DESTINATION = "org.freedesktop.UDisks2"`.
+   - The body’s options may specify:
+     - A mount point on the host filesystem that is visible and writable from the sandbox (e.g., a directory under `/tmp` or a bind‑mounted host path).
+     - Flags like `auth.no_user_interaction=true` if allowed by policy, to avoid GUI prompts. Even if an interactive Polkit dialog appears, the user may unknowingly authorize it; either way, the sandbox is supposed to prevent the sandboxed app from even *reaching* this privileged interface.
+
+3. **Routing and privileged execution:**
+   - Because `DESTINATION` is `org.freedesktop.UDisks2`, the system bus routes this unicast message to the root‑running `udisksd` process rather than to the bus daemon itself or a benign peer.
+   - `udisksd` validates the call and, if Polkit authorizes it under the host’s normal desktop rules, performs the mount as root in the host namespace.
+   - The sandbox’s intended design goal (no direct disk access from untrusted code) is thus bypassed: the attacker has used the system’s own privileged storage daemon to mount host block devices in a location reachable from inside the sandbox.
+
+4. **Impact: sandbox / container breakout via host filesystem access:**
+   - Once a host block device (e.g., the root filesystem, a data partition, or other users’ partitions) is mounted into a directory visible to the sandboxed process, the process can:
+     - Read and exfiltrate host data that the sandbox was meant to hide.
+     - Modify host files (e.g., adding `authorized_keys`, tampering with system binaries or configuration) to obtain persistent code execution or higher privileges outside the sandbox.
+   - The critical factor is the attacker’s ability to steer the `METHOD_CALL` to `org.freedesktop.UDisks2` using the `DESTINATION` field. If:
+     - `DESTINATION` were unset or set to a non‑privileged name, the same PATH/INTERFACE/MEMBER/body would **not** be delivered to `udisksd` and no mount would occur.
+     - A correct sandbox policy blocked `DESTINATION=org.freedesktop.UDisks2`, the attacker would be limited to unprivileged peers and would not gain host‑level filesystem access.
+   - This is exactly why systems like Flatpak explicitly treat access to system bus names such as `org.freedesktop.UDisks2` as a high‑risk capability and deny it to sandboxes: compromising control of `DESTINATION` effectively gives untrusted code a powerful host‑level primitive.
+
+---
+
+**Attack Message:**
+
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": "METHOD_CALL",
+    "flags": 0,
+    "protocol_version": 1,
+    "serial": 42
+  },
+  "header_fields": {
+    "PATH": "/org/freedesktop/UDisks2/block_devices/sda1",
+    "INTERFACE": "org.freedesktop.UDisks2.Filesystem",
+    "MEMBER": "Mount",
+    "DESTINATION": "org.freedesktop.UDisks2",
+    "SIGNATURE": "a{sv}"
+  },
+  "body": {
+    "options": {
+      "auth.no_user_interaction": { "type": "b", "value": true },
+      "fstype": { "type": "s", "value": "auto" },
+      "options": { "type": "s", "value": "defaults" },
+      "mount_points": { "type": "as", "value": ["/tmp/host-mount"] }
+    }
+  },
+  "_exploit_context": "The only difference between a benign, bus-directed call and this privileged operation is the DESTINATION header: setting DESTINATION to \"org.freedesktop.UDisks2\" causes the system bus to route this Mount call to udisksd running as root, which then performs a host filesystem mount. Flatpak and similar sandbox systems explicitly deny direct access to this DESTINATION because any untrusted app allowed to send METHOD_CALLs there can obtain powerful host-level filesystem access."
+}
+```
+
+---
+
+**Classification:** ATTACK

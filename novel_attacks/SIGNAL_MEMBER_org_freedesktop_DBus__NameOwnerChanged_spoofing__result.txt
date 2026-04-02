@@ -1,0 +1,124 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Host runs a standard D‑Bus message bus (session or system) implementing `org.freedesktop.DBus` as spec’d.
+  - A privileged or security‑sensitive client (e.g., `com.example.SessionManager1`) runs on the same bus.  
+    - It subscribes to `org.freedesktop.DBus.NameOwnerChanged` on path `/org/freedesktop/DBus`.
+    - It uses a high‑level binding (GDBus, QtDBus, etc.) and **matches signals by `PATH` + `INTERFACE` + `MEMBER` only**, not by `SENDER`.
+    - It treats `NameOwnerChanged` as authoritative and wires security‑relevant logic to it (e.g., tracking lock‑screen helpers, privileged services, etc.).
+  - D‑Bus broker is correctly implemented: it sets the `SENDER` header and does **not** cryptographically authenticate signals; it allows arbitrary peers to emit broadcast signals on arbitrary `PATH`/`INTERFACE`/`MEMBER` unless policies forbid it.
+- **Attacker Capability:**
+  - Unprivileged local user with access to the same D‑Bus (system or session).
+  - Can establish a normal D‑Bus connection and send arbitrary `SIGNAL` messages with full control over:
+    - `PATH`, `INTERFACE`, `MEMBER` (the field under study),
+    - the body (signal arguments),
+    - but **not** the `SENDER` header (set by the bus).
+  - Cannot compromise the bus itself, but relies on a client that fails to verify `SENDER == "org.freedesktop.DBus"` for `NameOwnerChanged`.
+
+---
+
+**Attack Procedure:**
+
+1. **Preparation – identify a trusting client**
+
+   The attacker identifies a process `com.example.SessionManager1` (or similar session manager / lock‑screen controller) that:
+
+   - Subscribes to `NameOwnerChanged`:
+
+     ```text
+     type='signal',
+     interface='org.freedesktop.DBus',
+     member='NameOwnerChanged',
+     path='/org/freedesktop/DBus'
+     ```
+
+   - Does *not* additionally constrain `sender='org.freedesktop.DBus'`, or ignores the sender in its callback.
+   - Uses these signals to track ownership of a well‑known name, for example `com.example.LockHelper1`, which is responsible for keeping the screen locked or guarding a privileged UI.
+
+   Typical behavior:
+
+   - When `com.example.LockHelper1` gains an owner, the session manager treats the session as “locked / protected”.
+   - When `NameOwnerChanged("com.example.LockHelper1", old_owner, "")` is seen (owner disappears), it assumes the lock helper exited cleanly or crashed and transitions to an “unlocked” or “fallback” state, often in a security‑sensitive way (e.g., unlocking the screen, disabling certain protections, or attempting an automatic reconnect that temporarily relaxes policy).
+
+2. **Exploit – forge a `NameOwnerChanged` signal**
+
+   The attacker connects to the same bus (e.g., with `dbus-send` or a small custom program) and emits:
+
+   - `PATH = "/org/freedesktop/DBus"`
+   - `INTERFACE = "org.freedesktop.DBus"`
+   - **`MEMBER = "NameOwnerChanged"`** (critical field)
+   - No `DESTINATION` (broadcast to all listeners).
+   - Body with three strings:  
+     `("com.example.LockHelper1", ":1.55", "")`
+
+   Because the bus does not treat the `org.freedesktop.DBus` interface as privileged for signal emission, it will happily forward the signal. It will set `SENDER` to the attacker’s unique name, e.g. `":1.123"`, but otherwise make no distinction between this and a genuine broker‑emitted signal.
+
+   The vulnerable client’s match rule is satisfied **solely because**:
+
+   - `PATH` matches `/org/freedesktop/DBus`
+   - `INTERFACE` matches `org.freedesktop.DBus`
+   - **`MEMBER` matches `NameOwnerChanged`**
+
+   If `MEMBER` were anything else (e.g., `"Foo"`, `"NameLost"`, `"OwnerChanged"`), the high‑level binding would not connect it to the `NameOwnerChanged` handler and the spoof would be ignored.
+
+3. **Client misbehavior – trust in spoofed signal**
+
+   Inside `com.example.SessionManager1`, the high‑level binding invokes the handler associated with `NameOwnerChanged`:
+
+   ```pseudo
+   on_name_owner_changed(name, old_owner, new_owner):
+       if name == "com.example.LockHelper1" and new_owner == "":
+           // lock helper is gone, stop enforcing lock
+           disable_lock_screen()
+           mark_session_unlocked()
+   ```
+
+   Because the client does **not** check `SENDER == "org.freedesktop.DBus"`, it treats the spoofed signal (with `SENDER=":1.123"`) as if it came from the bus itself. The result:
+
+   - `disable_lock_screen()` is called, effectively unlocking the user’s session.
+   - Alternatively, in other designs, it may:
+     - Stop requiring a helper for privileged operations.
+     - Cancel security prompts.
+     - Assume a privileged service crashed and perform recovery actions that temporarily lower security.
+
+4. **Impact**
+
+   - Local privilege/security boundary is bypassed:
+     - The attacker can unlock another user’s session or disable protection that depends on the presence of a well‑known name.
+   - The only *special* capability required is the ability to set **`MEMBER="NameOwnerChanged"`** on a signal using the standard bus. That field is **entirely controlled by the sender**, per the D‑Bus spec.
+   - The D‑Bus `SENDER` header would have been a reliable authenticity indicator (set by the broker), but the vulnerable client ignores it; the attack therefore hinges on the match rule using `MEMBER` as the trusted discriminator instead.
+
+   If the attacker were forced to use any other `MEMBER` value, the vulnerable client would not dispatch to the `NameOwnerChanged` handler at all, and the exploit would fail. Thus, **the attacker’s control over `MEMBER` is the critical precondition**.
+
+---
+
+**Attack Message:**
+
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": "SIGNAL",
+    "flags": ["NO_REPLY_EXPECTED"],
+    "protocol_version": 1,
+    "serial": 42
+  },
+  "header_fields": {
+    "PATH": "/org/freedesktop/DBus",
+    "INTERFACE": "org.freedesktop.DBus",
+    "MEMBER": "NameOwnerChanged",
+    "DESTINATION": null,
+    "SENDER": ":1.123",
+    "SIGNATURE": "sss"
+  },
+  "body": {
+    "0": { "name": "name",       "type": "STRING", "value": "com.example.LockHelper1" },
+    "1": { "name": "old_owner",  "type": "STRING", "value": ":1.55" },
+    "2": { "name": "new_owner",  "type": "STRING", "value": "" }
+  },
+  "_exploit_context": "The critical field is MEMBER='NameOwnerChanged'. The vulnerable client subscribes to signals by PATH='/org/freedesktop/DBus', INTERFACE='org.freedesktop.DBus', MEMBER='NameOwnerChanged' only, and fails to verify that SENDER=='org.freedesktop.DBus'. Because MEMBER is fully controlled by the message sender per the D-Bus specification, an unprivileged peer can forge this signal and cause the client to execute security-sensitive logic (e.g., unlock a session) based on false name-ownership information."
+}
+```
+
+---
+
+**Classification:** ATTACK

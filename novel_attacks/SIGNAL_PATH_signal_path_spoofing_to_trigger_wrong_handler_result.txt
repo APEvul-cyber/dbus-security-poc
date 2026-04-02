@@ -1,0 +1,102 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Target platform is a typical modern Linux distribution using the standard `dbus-daemon` system bus.
+  - A privileged root daemon `org.example.ConfigManager1` runs on the *system* bus. It:
+    - Exposes an object at path `/org/example/ConfigManager1`.
+    - Subscribes to the signal `org.example.ConfigManager1.ConfigFileChanged` with a match rule equivalent to:
+      - `type='signal', path='/org/example/ConfigManager1', interface='org.example.ConfigManager1', member='ConfigFileChanged'`
+    - Does **not** restrict the `SENDER` or check peer credentials.
+    - On receiving the signal, treats it as if it came from its own trusted helper and:
+      - Reloads the configuration file given as the single string argument.
+      - Then applies configuration or writes status under root privileges.
+  - The system bus policy allows any local (unprivileged) user to connect and send signals that pass basic policy checks (typical for many system services).
+  - This pattern matches multiple real‑world D‑Bus vulnerabilities where privileged daemons trusted spoofable signals that were only filtered by PATH/INTERFACE/MEMBER.
+
+- **Attacker Capability:**
+  - The attacker is an unprivileged local user.
+  - They can open a connection to the system bus and send arbitrary D‑Bus `SIGNAL` messages.
+  - Crucially, they have full control over the `PATH` header field and can set it to *any* valid object path, including `/org/example/ConfigManager1`.
+  - They can also freely choose the interface, member name, and the signal’s body (the filename string).
+
+---
+
+**Attack Procedure:**
+
+1. **Discover the target interface and match behavior:**
+   - The attacker inspects the bus (e.g., using `busctl`, `dbus-send`, or `gdbus`) to see that `org.example.ConfigManager1`:
+     - Owns the bus name `org.example.ConfigManager1`.
+     - Has an object at `/org/example/ConfigManager1`.
+     - Listens for a signal `ConfigFileChanged` on `org.example.ConfigManager1` with a single `string` argument (the configuration file path).
+   - They also determine, via testing or code review, that:
+     - The daemon has installed a match rule only on `PATH`, `INTERFACE`, and `MEMBER`.
+     - No check is performed on the `SENDER`, and no additional credential verification is done.
+
+2. **Understand the misuse of PATH:**
+   - According to the D‑Bus spec, the `PATH` header field is entirely **controlled by the sender** and only required to be syntactically valid.
+   - The bus does not enforce any relationship between `PATH` and the actual “origin” of the signal; it merely routes/broadcasts based on match rules.
+   - The daemon incorrectly treats “signal with `PATH=/org/example/ConfigManager1` + interface + member” as proof that it came from its trusted helper object, making this PATH value a *de facto* authenticity token.
+
+3. **Craft a spoofed signal:**
+   - The attacker crafts a `SIGNAL` message with:
+     - `PATH = "/org/example/ConfigManager1"` (the exact value the daemon is matching on).
+     - `INTERFACE = "org.example.ConfigManager1"`.
+     - `MEMBER = "ConfigFileChanged"`.
+     - A single string argument containing an attacker‑chosen, but root‑interpreted, configuration file path, e.g.:
+       - A file the attacker controls that contains malicious directives; or
+       - A sensitive file like `/etc/shadow` if the daemon incorrectly parses/reads/logs it.
+   - Because the PATH matches the daemon’s subscription rule, the message is delivered to and accepted by `org.example.ConfigManager1`.
+
+4. **Trigger privileged behavior:**
+   - On receiving the spoofed signal, the daemon:
+     - Assumes it came from its own helper.
+     - Opens and parses the supplied configuration file as root.
+     - Applies the new configuration immediately.
+   - Depending on the daemon’s behavior and configuration syntax, the attacker can:
+     - Cause the daemon to execute commands or scripts as root.
+     - Make the daemon write to privileged locations (e.g., generating logs, state files, or temporary files under `/var` or `/etc`).
+     - Induce the daemon to load attacker‑controlled plugins or modules.
+   - This yields **privilege escalation**: arbitrary code execution or powerful file/system modifications under root.
+
+5. **Why PATH is exploit‑critical:**
+   - The daemon’s match rule and trust decision hinge on:
+     - `path = '/org/example/ConfigManager1'`
+     - `interface = 'org.example.ConfigManager1'`
+     - `member = 'ConfigFileChanged'`
+   - The attacker must supply exactly this PATH to get the signal delivered and trusted:
+     - If the PATH were `/org/example/OtherObject` or any other value, the daemon’s match rule would not trigger and the signal would be ignored.
+   - The core design flaw is *treating the PATH field (which the spec declares sender‑controlled) as an authenticity indicator*.
+   - Without arbitrary control of PATH, the attacker could not masquerade as the privileged helper object and would be unable to trigger the privileged reload routine.
+
+---
+
+**Attack Message:**
+
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": "SIGNAL",
+    "flags": 0,
+    "protocol_version": 1,
+    "serial": 42
+  },
+  "header_fields": {
+    "PATH": "/org/example/ConfigManager1",
+    "INTERFACE": "org.example.ConfigManager1",
+    "MEMBER": "ConfigFileChanged",
+    "DESTINATION": "org.example.ConfigManager1",
+    "SIGNATURE": "s"
+  },
+  "body": {
+    "0": "/home/attacker/.config/org.example/malicious.conf"
+  },
+  "_exploit_context": "The org.example.ConfigManager1 daemon subscribes to this signal with a match rule on PATH=/org/example/ConfigManager1, INTERFACE=org.example.ConfigManager1, MEMBER=ConfigFileChanged, and does not verify SENDER. The D-Bus spec states that PATH is controlled by the message sender; by forging this PATH and the other headers, an unprivileged client can spoof a 'trusted' ConfigFileChanged signal and force the daemon to reload an attacker-controlled configuration file as root."
+}
+```
+
+- Changing the `PATH` header to any value other than `/org/example/ConfigManager1` would cause the daemon’s match rule not to fire, and the payload would not be processed.
+- Thus, the ability to arbitrarily set PATH to this *exact* value is necessary and sufficient (given the daemon’s bug) to carry out the attack.
+
+---
+
+**Classification:** ATTACK

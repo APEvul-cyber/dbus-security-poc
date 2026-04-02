@@ -1,0 +1,108 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Host: Linux system (desktop, laptop, or embedded) using `wpa_supplicant` on the **system bus**, typically via NetworkManager or a similar network manager.
+  - Service: `fi.w1.wpa_supplicant1` using the “new-style” D‑Bus API, with objects `/fi/w1/wpa_supplicant1/Interfaces/<id>` implementing `fi.w1.wpa_supplicant1.Interface`.
+  - Configuration:  
+    - `wpa_supplicant` runs as root.  
+    - The D‑Bus system bus configuration has been **overly relaxed** by the integrator (for example, in `/usr/share/dbus-1/system.d/wpa_supplicant.conf` or equivalent), allowing unprivileged users to invoke configuration‑changing methods such as `AddNetwork(a{sv})` on `fi.w1.wpa_supplicant1.Interface` instead of restricting them to root/NetworkManager.
+    - This kind of misconfiguration is realistic in custom distributions, OEM images, or hurried hardening efforts where policies are broadened ("allow send_member='*'") for compatibility.
+  - No other local privilege is assumed beyond being able to connect to the system bus as an ordinary user.
+
+- **Attacker Capability:**
+  - The attacker is an unprivileged local user with a working connection to the **system D‑Bus**.
+  - They can send arbitrary `METHOD_CALL` messages, fully controlling:
+    - `DESTINATION` = `fi.w1.wpa_supplicant1`
+    - `PATH` = `/fi/w1/wpa_supplicant1/Interfaces/0` (or whichever interface object exists)
+    - `INTERFACE` = `fi.w1.wpa_supplicant1.Interface`
+    - Critically, the `MEMBER` header field (code 3) of the `METHOD_CALL`.
+    - The message body, including the dictionary `a{sv}` argument to `AddNetwork`.
+  - The attack hinges on the ability to set `MEMBER = "AddNetwork"`; other member names on the same interface/path (such as getters or benign operations) would not reconfigure Wi‑Fi networks.
+
+---
+
+**Attack Procedure:**
+
+1. **Enumerate interfaces and confirm access**  
+   - The attacker introspects `fi.w1.wpa_supplicant1` (or uses documentation) to find interface objects such as `/fi/w1/wpa_supplicant1/Interfaces/0` implementing `fi.w1.wpa_supplicant1.Interface`.
+   - They verify that a `METHOD_CALL` with `MEMBER="AddNetwork"` does not fail with a D‑Bus access‑denied error, confirming the misconfigured policy.
+
+2. **Craft a malicious network profile using `AddNetwork(a{sv})`**  
+   - The attacker prepares method arguments to create a network profile that directs the host to an attacker‑controlled Wi‑Fi access point. For example:
+     - `ssid`: the corporate or trusted SSID (e.g., `"CorpWiFi"`) encoded as `ay`.
+     - `key_mgmt`: `"WPA-PSK"` or `"NONE"`, depending on how the attacker plans to lure the device.
+     - `psk`: a preshared key chosen by the attacker (for a rogue network with the same SSID as the legitimate one, but on the attacker’s AP).
+   - They send a `METHOD_CALL` with:
+     - `PATH` = `/fi/w1/wpa_supplicant1/Interfaces/0`
+     - `INTERFACE` = `fi.w1.wpa_supplicant1.Interface`
+     - `MEMBER` = `AddNetwork`
+   - The service, running as root, creates a new `fi.w1.wpa_supplicant1.Network` object and returns its object path.
+
+3. **Optionally enable / select the network**  
+   - Depending on the API version/semantics, the network might be:
+     - Enabled by default, or
+     - Require either:
+       - A property such as `Enabled=true` in the `AddNetwork` options, or
+       - A follow‑up call like `SelectNetwork` or setting an `Enabled` property on the returned network object.
+   - Since the attacker controls `MEMBER`, they can subsequently issue another `METHOD_CALL` with `MEMBER="SelectNetwork"` (or equivalent) on the new network object path if the policy is equally misconfigured.
+   - Result: the host will automatically associate with the attacker’s Wi‑Fi when in range, or immediately, depending on signal and priority.
+
+4. **Impact on the victim system**
+   - Once the host connects to the attacker‑controlled access point:
+     - The attacker can **intercept, modify, and reroute network traffic** (classic man‑in‑the‑middle), including unencrypted HTTP and misconfigured TLS.
+     - They can present captive portals, credential phishing pages, or downgrade attacks.
+     - Routing and DNS on the victim can be manipulated to pivot to internal resources, exfiltrate data, or direct software updates to malicious endpoints.
+   - This is a clear escalation of control over the victim’s network environment, achieved purely through D‑Bus method calls originating from an unprivileged local user.
+
+5. **Why `MEMBER` control is critical**
+   - On the same bus address/path/interface:
+     - A `METHOD_CALL` with `MEMBER="GetProperties"` or `MEMBER="Scan"` would be read‑only or harmless; it would not change Wi‑Fi configuration or connect to new APs.
+     - Switching only the `MEMBER` header to `AddNetwork` moves execution into a **privileged code path** that creates persistent network configuration objects owned by the root‑run wpa_supplicant.
+   - The vulnerability is not in the existence of the interface or path per se, but in misconfigured D‑Bus policy that fails to restrict **which members** can be called. The attacker’s ability to set `MEMBER="AddNetwork"` is thus the deciding factor between safe introspection and dangerous state mutation.
+
+---
+
+**Attack Message:**
+
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": "METHOD_CALL",
+    "flags": 0,
+    "protocol_version": 1,
+    "serial": 42
+  },
+  "header_fields": {
+    "PATH": "/fi/w1/wpa_supplicant1/Interfaces/0",
+    "INTERFACE": "fi.w1.wpa_supplicant1.Interface",
+    "MEMBER": "AddNetwork",
+    "DESTINATION": "fi.w1.wpa_supplicant1",
+    "SIGNATURE": "a{sv}"
+  },
+  "body": [
+    {
+      "ssid": {
+        "type": "ay",
+        "value": [67, 111, 114, 112, 87, 105, 70, 105] 
+      },
+      "key_mgmt": {
+        "type": "s",
+        "value": "WPA-PSK"
+      },
+      "psk": {
+        "type": "s",
+        "value": "attacker-chosen-passphrase"
+      },
+      "priority": {
+        "type": "i",
+        "value": 100
+      }
+    }
+  ],
+  "_exploit_context": "This METHOD_CALL targets the root-owned fi.w1.wpa_supplicant1 service on the system bus. The critical aspect is MEMBER='AddNetwork', which (per the wpa_supplicant D-Bus API) creates a new Network object and stores a Wi-Fi profile. With misconfigured D-Bus policy allowing unprivileged callers to invoke this member, an attacker can inject a malicious network configuration (e.g., a high-priority rogue AP matching a trusted SSID). If MEMBER were a harmless getter, the same PATH/INTERFACE/DESTINATION would not mutate Wi-Fi configuration."
+}
+```
+
+---
+
+**Classification:** ATTACK

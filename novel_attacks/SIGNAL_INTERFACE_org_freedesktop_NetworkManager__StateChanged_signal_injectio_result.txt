@@ -1,0 +1,116 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Typical Linux system with a standard `system` D‑Bus.
+  - NetworkManager is running and exposes its usual D‑Bus API at:
+    - `PATH=/org/freedesktop/NetworkManager`
+    - `INTERFACE=org.freedesktop.NetworkManager`
+  - A third‑party, privileged helper service `com.example.NMFirewallHelper` (running as root) is installed. It is intended to react to NetworkManager state changes and reconfigure firewall / routing.
+  - For convenience, instead of listening for NetworkManager’s `StateChanged` *signal*, the helper implements a D‑Bus *method* with the same tuple:
+    - `PATH=/org/freedesktop/NetworkManager`
+    - `INTERFACE=org.freedesktop.NetworkManager`
+    - `MEMBER=StateChanged`
+    - `SIGNATURE="u"` (new connectivity state)
+  - The helper’s D‑Bus policy on the system bus allows any local user to send method calls to `com.example.NMFirewallHelper` (common for “helper” style services that assume only trusted components will talk to them).
+  - The helper’s internal logic uses only the `(PATH, INTERFACE, MEMBER)` triple to decide that a call is “really from NetworkManager” and does **not** verify the D‑Bus `SENDER` (unique name or well‑known name owner) or caller credentials.
+
+- **Attacker Capability:**
+  - Unprivileged local user able to connect to the system bus (default on most distros).
+  - Can send arbitrary `METHOD_CALL` messages to `com.example.NMFirewallHelper`, with full control over:
+    - `PATH`
+    - `INTERFACE`
+    - `MEMBER`
+    - method arguments (body)
+  - Specifically, can set `INTERFACE` to any string, including `org.freedesktop.NetworkManager`.
+
+---
+
+**Attack Procedure:**
+
+1. **Recon / Assumption of Helper Behavior:**
+   - The attacker knows (via documentation, introspection, or reverse‑engineering) that:
+     - `com.example.NMFirewallHelper` exposes a method that it expects only NetworkManager to “call” as an internal notification:
+       - `PATH=/org/freedesktop/NetworkManager`
+       - `INTERFACE=org.freedesktop.NetworkManager`
+       - `MEMBER=StateChanged`
+       - `SIGNATURE="u"`
+     - When that method is invoked, the helper:
+       - Rewrites iptables rules (e.g., opening ports or enabling NAT),
+       - Updates routing and forwarding,
+       - Potentially toggles VPN or other privileged network state.
+     - The helper *implicitly* trusts that anything with `INTERFACE=org.freedesktop.NetworkManager` and `MEMBER=StateChanged` came from the actual NetworkManager daemon, and performs the privileged actions without checking the caller’s identity.
+
+2. **Crafting the Malicious METHOD_CALL:**
+   - The attacker connects to the system bus (e.g., via `dbus-send`, `gdbus`, or a custom program).
+   - They craft a `METHOD_CALL` with:
+     - `DESTINATION="com.example.NMFirewallHelper"`
+     - `PATH="/org/freedesktop/NetworkManager"`
+     - `INTERFACE="org.freedesktop.NetworkManager"`
+     - `MEMBER="StateChanged"`
+     - `SIGNATURE="u"`
+     - Body: a crafted state code (e.g., `70`) that the helper interprets as “fully online, external interface up” or some state that causes it to relax firewall rules.
+
+3. **Message Routing and Misinterpretation:**
+   - The system bus routes the method to `com.example.NMFirewallHelper` because the `DESTINATION` matches its well‑known name and bus policy allows `METHOD_CALL` messages to that service.
+   - The D‑Bus daemon does **not** verify that `INTERFACE="org.freedesktop.NetworkManager"` is in any way bound to the real NetworkManager process; the field is entirely sender‑controlled per the D‑Bus spec.
+   - Inside the helper:
+     - It checks that:
+       - `PATH == "/org/freedesktop/NetworkManager"`
+       - `INTERFACE == "org.freedesktop.NetworkManager"`
+       - `MEMBER == "StateChanged"`
+     - Seeing these values, it assumes “this call is NetworkManager telling me the network state changed” and proceeds.
+     - It **does not** check:
+       - The caller’s unique name or well‑known bus name owner,
+       - UID/GID of the caller,
+       - Any cryptographic or OS‑level authentication.
+   - Therefore, the unprivileged attacker’s method call is treated as authoritative NetworkManager input.
+
+4. **Impact: Privileged Network Reconfiguration from Unprivileged User:**
+   - In response to the spoofed call, `com.example.NMFirewallHelper`:
+     - Updates iptables to open ports or disable restrictive rules,
+     - Adjusts routing (e.g., enabling IP forwarding or changing default routes),
+     - Possibly triggers VPN teardown or other security‑sensitive changes.
+   - The attacker achieves a **privilege misuse / policy bypass**:
+     - They indirectly control root‑level firewall and routing configuration without root or elevated privileges.
+     - This can be leveraged to:
+       - Expose local services to the network,
+       - Bypass local firewall policies,
+       - Facilitate lateral movement or data exfiltration.
+
+5. **Why INTERFACE is Exploit‑Critical:**
+   - The helper’s logic triggers *only* when `INTERFACE` is exactly `org.freedesktop.NetworkManager` (and `PATH`/`MEMBER` match).
+   - If the attacker uses any other `INTERFACE`, the message is ignored or handled as a generic, low‑privilege call.
+   - Thus, the ability to arbitrarily set the `INTERFACE` header string to `org.freedesktop.NetworkManager` is essential for the exploit:
+     - It is the mistaken “identity signal” that the helper uses to assume “this must be NetworkManager”.
+     - The D‑Bus spec explicitly states `INTERFACE` is a sender‑controlled string; the bus does not authenticate it.
+   - This is the same class of error widely warned about in D‑Bus security discussions: treating sender‑controlled metadata (`INTERFACE`, `PATH`, `MEMBER`) as a trust or identity indicator instead of verifying `SENDER`/credentials.
+
+---
+
+**Attack Message:**
+
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": "METHOD_CALL",
+    "flags": ["no_reply_expected"],
+    "protocol_version": 1,
+    "serial": 42
+  },
+  "header_fields": {
+    "PATH": "/org/freedesktop/NetworkManager",
+    "INTERFACE": "org.freedesktop.NetworkManager",
+    "MEMBER": "StateChanged",
+    "DESTINATION": "com.example.NMFirewallHelper",
+    "SIGNATURE": "u"
+  },
+  "body": {
+    "state": 70
+  },
+  "_exploit_context": "The privileged daemon com.example.NMFirewallHelper assumes any METHOD_CALL with PATH=/org/freedesktop/NetworkManager, INTERFACE=org.freedesktop.NetworkManager, MEMBER=StateChanged originates from the real NetworkManager and performs root-level firewall/routing changes based solely on these header fields. Because INTERFACE is entirely sender-controlled per the D-Bus spec, an unprivileged client can spoof this value and trigger those privileged actions."
+}
+```
+
+---
+
+**Classification:** ATTACK
