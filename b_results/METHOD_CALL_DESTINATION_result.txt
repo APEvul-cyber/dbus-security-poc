@@ -1,0 +1,109 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Target platform: Ubuntu (desktop or server) with the `usb-creator` package installed and its privileged helper exposed on the **system** D‑Bus as `com.ubuntu.USBCreator`.
+  - The helper runs as `root` and is intended to write disk images to removable devices on behalf of unprivileged users.
+  - Historical default D‑Bus/polkit policies allowed local desktop users to invoke sensitive methods (e.g., `Image`) either without proper authorization or with flawed checks, as documented in Ubuntu security advisories / Launchpad bugs for `usb-creator`.
+  - Standard freedesktop.org system bus behavior: any local user with a session on the machine can connect to the system bus and send `METHOD_CALL`s to many well‑known names, subject to bus policy.
+
+- **Attacker Capability:**
+  - The attacker is an unprivileged local user who can:
+    - Connect to the **system** bus.
+    - Send `METHOD_CALL` messages with **full control over the `DESTINATION` header field** as well as PATH, INTERFACE, MEMBER, and the method arguments.
+  - Specifically, the attacker can set:
+    - `DESTINATION = "com.ubuntu.USBCreator"`
+    - `PATH = "/com/ubuntu/USBCreator"`
+    - `INTERFACE = "com.ubuntu.USBCreator"`
+    - `MEMBER = "Image"`
+    - with arbitrary arguments describing a source image and a target block device.
+
+---
+
+**Attack Procedure:**
+
+1. **Discovery / Preconditions**
+   - The attacker verifies that the system bus exports a well‑known name `com.ubuntu.USBCreator` and that a root helper is activatable (or already running) under that name.
+   - Historical advisories / bug reports indicate that the `Image` method on `com.ubuntu.USBCreator` can be invoked by unprivileged users and that its authorization checks are missing or insufficient, allowing arbitrary device selection (e.g., `/dev/sda`).
+
+2. **Why `DESTINATION` is Critical**
+   - On a D‑Bus **message bus**, `DESTINATION` determines which connection receives a unicast message, independently of match rules.
+   - By setting `DESTINATION = "com.ubuntu.USBCreator"`, the attacker makes sure that the **root‑owned usb‑creator helper** is the one that receives and processes the crafted `METHOD_CALL`.
+   - If `DESTINATION` were any other value (e.g., omitted, or set to a benign user‑owned name), the message:
+     - Would not be routed to the root usb‑creator service at all, or
+     - Would be delivered to some other, less‑privileged peer that does not perform disk writes.
+   - Thus, control of `DESTINATION` is what converts an otherwise harmless message into one that hits a sensitive privileged target.
+
+3. **Crafting the Malicious Call**
+   - The attacker prepares a `METHOD_CALL` with:
+     - `DESTINATION = "com.ubuntu.USBCreator"` (select the privileged helper).
+     - `PATH = "/com/ubuntu/USBCreator"`.
+     - `INTERFACE = "com.ubuntu.USBCreator"`.
+     - `MEMBER = "Image"`.
+     - `SIGNATURE` and body corresponding to the vulnerable API, e.g.:
+       - Source image path: an attacker‑controlled `.img` file (or any data).
+       - Target device: a sensitive block device such as `/dev/sda` (system disk) or a different user’s encrypted volume.
+   - The attacker sends this message on the system bus. The bus, per specification, routes the unicast message to the current owner of `com.ubuntu.USBCreator`.
+
+4. **Privileged Helper Misbehavior**
+   - The root usb‑creator helper receives the method call (because of the chosen `DESTINATION`) and:
+     - Performs minimal or no further authentication/authorization.
+     - Opens the specified target device (e.g., `/dev/sda`) with root privileges.
+     - Writes the supplied image data onto the device.
+   - Depending on the exact bug/policy:
+     - The attacker can **overwrite arbitrary block devices**, corrupting or replacing system partitions.
+     - This can be used to:
+       - Destroy data (denial of service).
+       - Overwrite the bootloader/OS and then boot into an attacker‑controlled image, resulting in **full root compromise on next boot**.
+       - Overwrite another user’s data partition to cause targeted damage.
+
+5. **Why Other `DESTINATION` Values Are Non‑Exploitable**
+   - If `DESTINATION` is unset or set to a different name, the system bus will:
+     - Either attempt broadcast routing (depending on the message) where no privileged service listens for this interface/member at this path, resulting in a no‑op.
+     - Or deliver the message to a non‑privileged client that does not have the capability to write block devices.
+   - Only by selecting the **specific** well‑known name `com.ubuntu.USBCreator` can the attacker reach the root helper that implements the vulnerable logic. Thus, the exploit path depends critically on controlling the `DESTINATION` field.
+
+---
+
+**Attack Message:**
+
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": "METHOD_CALL",
+    "flags": [],
+    "protocol_version": 1,
+    "serial": 42
+  },
+  "header_fields": {
+    "PATH": "/com/ubuntu/USBCreator",
+    "INTERFACE": "com.ubuntu.USBCreator",
+    "MEMBER": "Image",
+    "DESTINATION": "com.ubuntu.USBCreator",
+    "SIGNATURE": "ss"
+  },
+  "body": {
+    "src_image_path": {
+      "type": "s",
+      "value": "/home/attacker/malicious.img"
+    },
+    "target_device": {
+      "type": "s",
+      "value": "/dev/sda"
+    }
+  },
+  "_exploit_context": {
+    "description": "This METHOD_CALL is routed by the system bus to the root-owned usb-creator helper because DESTINATION matches its well-known name. Historical Ubuntu bugs for com.ubuntu.USBCreator show that unprivileged users could cause it to write arbitrary images to attacker-chosen block devices, leading to local privilege escalation or destructive DoS.",
+    "references": [
+      "D-Bus Specification: DESTINATION field & message-bus routing",
+      "Launchpad usb-creator security bugs and associated Ubuntu advisories"
+    ],
+    "exploit_critical_field": "DESTINATION=com.ubuntu.USBCreator"
+  }
+}
+```
+
+In this example, changing `DESTINATION` to any other name (or omitting it) would prevent the message from reaching the privileged `com.ubuntu.USBCreator` service and would therefore not trigger the vulnerable disk-writing behavior.
+
+---
+
+**Classification:** ATTACK

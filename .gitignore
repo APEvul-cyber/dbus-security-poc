@@ -1,0 +1,4 @@
+# dbus-testbed 临时文件
+*.pyc
+__pycache__/
+.DS_Store

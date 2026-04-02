@@ -1,0 +1,105 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Target platform: Ubuntu desktop (e.g., 12.04/12.10 era) with the `usb-creator` package installed.
+  - Service: System-bus-activated D-Bus service `com.ubuntu.USBCreator`, object `/com/ubuntu/USBCreator`, interface `com.ubuntu.USBCreator`, running as root.
+  - Default/typical configuration (per CVE-2013-1060): D-Bus/PolicyKit policy allowed any local (or broadly authorized) user to invoke the `Image` method.
+  - Threat model: Unprivileged local user attempting privilege escalation or destructive writes to system data.
+
+- **Attacker Capability:**
+  - Can connect to the **system bus** as an unprivileged local user.
+  - Can send arbitrary `METHOD_CALL` messages to `com.ubuntu.USBCreator` with:
+    - Full control over the `MEMBER` field (the method name),
+    - Control over method arguments (image path, target path/device),
+    - Control over other standard header fields (PATH, INTERFACE, DESTINATION) consistent with the service.
+  - Cannot bypass D-Bus authentication or forge uid; the attack relies on policies that already allow the call.
+
+---
+
+**Attack Procedure:**
+
+1. **Service discovery and interface inspection**
+   - The attacker lists well-known names on the system bus and finds `com.ubuntu.USBCreator`.
+   - Using `org.freedesktop.DBus.Introspectable.Introspect` on `/com/ubuntu/USBCreator`, they see the `com.ubuntu.USBCreator` interface exposing a high-privilege method named `Image` (semantics: write a disk image to a target device/path as root).
+
+2. **Identify the critical field: `MEMBER = "Image"`**
+   - The D-Bus specification defines the `MEMBER` header field (code 3) as the method/signal name used to dispatch a message to a specific handler.
+   - On this service, **only** calls where `MEMBER` is set to `"Image"` reach the disk-writing code that runs with root-level access.
+   - Calls with other members (e.g., `GetStatus`, `Version`, or non-existent names) would not execute this privileged write path.
+
+3. **Craft malicious METHOD_CALL**
+   - The attacker prepares a `METHOD_CALL` with:
+     - `PATH` = `/com/ubuntu/USBCreator`
+     - `INTERFACE` = `com.ubuntu.USBCreator`
+     - `DESTINATION` = `com.ubuntu.USBCreator`
+     - **`MEMBER` = `Image`** (this is the exploit-critical choice)
+   - The method arguments point to:
+     - A source image controlled by the attacker (e.g., a filesystem containing a setuid root shell), and
+     - A target device or file path that the attacker wants to overwrite (e.g., `/dev/sda` or a root-owned file) and which the vulnerable implementation fails to properly restrict or validate.
+
+   Example intent:
+   - `source_image = "/home/attacker/rootfs.img"`
+   - `target_device = "/dev/sda"` (or a similarly critical block device or file)
+
+4. **Service misbehavior / vulnerability trigger**
+   - The system bus delivers the call and passes the caller’s uid (unprivileged) to `com.ubuntu.USBCreator`.
+   - Due to the historical D-Bus/PolicyKit configuration and weak internal checks (CVE-2013-1060), the service:
+     - Accepts the call from the unprivileged user,
+     - Trusts the supplied `target_device` path,
+     - Executes privileged operations (e.g., `dd`, `udisks`, or equivalent) as root to write `source_image` onto `target_device`.
+
+5. **Impact**
+   - Overwriting `/dev/sda` or a partition can:
+     - Destroy the installed OS, or
+     - Replace it with a system containing a pre-arranged root backdoor.
+   - Overwriting a root-owned file (if allowed by the bug) can:
+     - Replace `/etc/sudoers` or a PAM module to grant passwordless root access,
+     - Install a setuid root binary into a normally protected location.
+   - In all cases, the attacker escalates privileges or causes severe system compromise/destruction.
+
+6. **Why `MEMBER` control is essential**
+   - If the attacker could **not** set `MEMBER="Image"`:
+     - They would be limited to other methods (e.g., status, read-only, or safe helpers) that do not perform privileged writes.
+     - The dangerous code path that performs root-level disk writes would never be selected by the D-Bus dispatcher.
+   - The vulnerability is therefore **directly dependent** on the ability to send a `METHOD_CALL` with `MEMBER` exactly equal to `"Image"` on this interface and path.
+
+---
+
+**Attack Message:**
+
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": "METHOD_CALL",
+    "flags": 0,
+    "protocol_version": 1,
+    "serial": 42
+  },
+  "header_fields": {
+    "PATH": "/com/ubuntu/USBCreator",
+    "INTERFACE": "com.ubuntu.USBCreator",
+    "MEMBER": "Image",
+    "DESTINATION": "com.ubuntu.USBCreator",
+    "SIGNATURE": "ss"
+  },
+  "body": {
+    "args": [
+      {
+        "name": "source_image",
+        "type": "s",
+        "value": "/home/attacker/rootfs.img"
+      },
+      {
+        "name": "target_device",
+        "type": "s",
+        "value": "/dev/sda"
+      }
+    ]
+  },
+  "_exploit_context": "This METHOD_CALL targets the com.ubuntu.USBCreator.Image method (CVE-2013-1060). The critical factor is the MEMBER header field value 'Image', which dispatches to code that writes the supplied image to the specified device/path as root. Other MEMBER values would not trigger the vulnerable disk-writing behavior."
+}
+```
+
+---
+
+**Classification:** ATTACK

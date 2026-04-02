@@ -1,0 +1,13 @@
+[Unit]
+Description=Example PowerManager1 D-Bus Service (PoC 3 Target)
+After=dbus.service
+Requires=dbus.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/powermanager1-service.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

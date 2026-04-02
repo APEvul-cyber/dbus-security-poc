@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=com.ubuntu.USBCreator
+Exec=/usr/bin/python3 /usr/local/bin/usb-creator-service.py
+User=root

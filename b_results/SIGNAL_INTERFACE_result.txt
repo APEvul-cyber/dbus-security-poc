@@ -1,0 +1,107 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Host: Typical modern Linux distribution using the system bus (`/usr/bin/dbus-daemon` or `dbus-broker`) with standard freedesktop.org semantics.
+  - Services:
+    - `org.freedesktop.UDisks2` running as root on the system bus, exporting `/org/freedesktop/UDisks2` with interface `org.freedesktop.UDisks2.Manager`.
+    - A privileged helper `com.example.PowerManager1` also running as root, subscribed to UDisks2 signals in order to perform post‑processing when disk jobs complete.
+  - Bus configuration: Unprivileged local users are allowed to connect to the system bus and emit broadcast signals (no `DESTINATION`), as is common on many systems for benign signals.
+  - `com.example.PowerManager1` installs a match rule such as:
+    - `type='signal',interface='org.freedesktop.UDisks2.Manager',member='JobCompleted',path='/org/freedesktop/UDisks2'`
+    and **does not** verify the D‑Bus sender (unique name or well‑known name) of received signals.
+- **Attacker Capability:**
+  - Local unprivileged user with access to the system bus.
+  - Can send arbitrary `SIGNAL` messages on the system bus with full control over:
+    - `PATH`
+    - `INTERFACE` (the field under study)
+    - `MEMBER`
+    - Message body (arguments / signature)
+  - Cannot alter bus configuration or bypass normal D‑Bus authentication, but can emit unauthenticated broadcast signals impersonating *any* interface.
+
+---
+
+**Attack Procedure:**
+
+1. **Reconnaissance / Preconditions**
+   - The attacker discovers (e.g., via introspection, logs, or static analysis) that a root helper `com.example.PowerManager1`:
+     - listens for `org.freedesktop.UDisks2.Manager.JobCompleted` on `/org/freedesktop/UDisks2`, and
+     - runs privileged post‑processing (e.g., auto‑mounting devices, launching backup hooks, or changing power state) *without checking the sender*.
+   - The helper’s filter is based solely on the **INTERFACE**, `MEMBER`, and `PATH` fields in the signal, matching UDisks2’s API schema, not the actual service identity.
+
+2. **Crafting the Spoofed Signal**
+   - The attacker creates a D‑Bus `SIGNAL` with:
+     - `PATH = "/org/freedesktop/UDisks2"`
+     - `INTERFACE = "org.freedesktop.UDisks2.Manager"`
+     - `MEMBER = "JobCompleted"`
+     - No `DESTINATION` header (so it’s broadcast).
+   - The bus daemon does not verify that this `INTERFACE` really belongs to the genuine `org.freedesktop.UDisks2` service. Per the D‑Bus spec, INTERFACE is entirely sender‑controlled.
+   - The message body is filled with plausible arguments (e.g., a fake job ID and device path) to satisfy the helper’s expectations.
+
+3. **Delivery and Matching**
+   - The system bus routes the broadcast signal to all listeners whose match rules fit.
+   - `com.example.PowerManager1` has a match rule that **critically depends on INTERFACE**:
+     - `interface='org.freedesktop.UDisks2.Manager'`
+   - Because the attacker set `INTERFACE` to exactly that value, the bus delivers the spoofed signal to the helper.  
+     - If the attacker had used any other INTERFACE (e.g., `com.attacker.FakeInterface`), the match rule would not fire and the helper would never see the message.
+
+4. **Helper Misbehavior and Impact**
+   - On receipt, `com.example.PowerManager1` assumes the signal came from the trusted UDisks2 daemon and:
+     - Treats it as a legitimate notification that a disk job has completed.
+     - Performs root‑level actions based on the signal contents, such as:
+       - Auto‑mounting the “completed” device at a fixed or privileged mountpoint.
+       - Running backup or maintenance hooks on the attacker‑controlled device.
+       - Triggering power‑management actions (e.g., preventing suspend or forcing flushes).
+   - Potential concrete impacts:
+     - **Privilege escalation / arbitrary file operations**:
+       - If backup hooks run as root on the “completed” device, the attacker can craft a filesystem that executes arbitrary code or causes overwrites in root‑owned directories.
+     - **Policy bypass**:
+       - The attacker can force mounts, refreshes, or power‑related behaviors that are supposed to be driven only by real hardware events from UDisks2.
+
+   - The attack succeeds **specifically because** the INTERFACE field is treated as a trust boundary in the match rule and the helper’s dispatch logic. The bus does not authenticate INTERFACE, so attacker‑controlled INTERFACE enables signal spoofing.
+
+---
+
+**Attack Message:**
+
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": "SIGNAL",
+    "flags": 0,
+    "protocol_version": 1,
+    "serial": 42
+  },
+  "header_fields": {
+    "PATH": "/org/freedesktop/UDisks2",
+    "INTERFACE": "org.freedesktop.UDisks2.Manager",
+    "MEMBER": "JobCompleted",
+    "DESTINATION": null,
+    "SIGNATURE": "(sob)" 
+  },
+  "body": {
+    "0": {
+      "name": "job_path",
+      "type": "o",
+      "value": "/org/freedesktop/UDisks2/jobs/999"
+    },
+    "1": {
+      "name": "success",
+      "type": "b",
+      "value": true
+    },
+    "2": {
+      "name": "message",
+      "type": "s",
+      "value": "Job completed successfully"
+    }
+  },
+  "_exploit_context": {
+    "description": "Spoofed JobCompleted signal with INTERFACE='org.freedesktop.UDisks2.Manager' so that com.example.PowerManager1's match rule (type='signal',interface='org.freedesktop.UDisks2.Manager',member='JobCompleted',path='/org/freedesktop/UDisks2') fires and treats the signal as trusted. The INTERFACE value is attacker-controlled and not authenticated by the bus, making it critical to the spoofing attack.",
+    "spec_reference": "D-Bus Specification: INTERFACE header field is sender-controlled and required for signals; broadcast routing and match rules rely on interface, but the bus does not verify that the interface belongs to a particular service."
+  }
+}
+```
+
+---
+
+**Classification:** ATTACK

@@ -1,0 +1,88 @@
+
+# D-Bus 协议安全 PoC 验证测试环境
+# 使用方法: docker compose up -d && docker compose exec <container> bash
+
+services:
+  # ============================================================
+  # 容器 1: PoC 1 (MEMBER) & PoC 2 (DESTINATION)
+  # Ubuntu 22.04 + 模拟 USBCreator 服务 (复现 CVE-2013-1060 逻辑)
+  # ============================================================
+  poc12-usbcreator:
+    build:
+      context: ./container1-usbcreator
+      dockerfile: Dockerfile
+    container_name: dbus-poc12-usbcreator
+    hostname: poc12-usbcreator
+    privileged: true
+    # systemd 需要的 cgroup 和 tmpfs
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ./b_results:/opt/poc-reports:ro
+    tmpfs:
+      - /run
+      - /run/lock
+    # systemd 作为 PID 1
+    command: /sbin/init
+    cap_add:
+      - SYS_ADMIN
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
+    networks:
+      - dbus-testnet
+
+  # ============================================================
+  # 容器 2: PoC 3 (INTERFACE 省略绕过 ACL)
+  # Ubuntu 22.04 + 自定义 D-Bus 服务 + send_interface 策略
+  # ============================================================
+  poc3-interface-acl:
+    build:
+      context: ./container2-interface-acl
+      dockerfile: Dockerfile
+    container_name: dbus-poc3-interface-acl
+    hostname: poc3-interface-acl
+    privileged: true
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ./b_results:/opt/poc-reports:ro
+    tmpfs:
+      - /run
+      - /run/lock
+    command: /sbin/init
+    cap_add:
+      - SYS_ADMIN
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
+    networks:
+      - dbus-testnet
+
+  # ============================================================
+  # 容器 3: PoC 4 (SENDER 伪造) & PoC 5 (SIGNAL INTERFACE 欺骗)
+  # Ubuntu 22.04 + Python D-Bus + P2P socket 支持
+  # ============================================================
+  poc45-p2p-signal:
+    build:
+      context: ./container3-p2p-signal
+      dockerfile: Dockerfile
+    container_name: dbus-poc45-p2p-signal
+    hostname: poc45-p2p-signal
+    privileged: true
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - ./b_results:/opt/poc-reports:ro
+    tmpfs:
+      - /run
+      - /run/lock
+    command: /sbin/init
+    cap_add:
+      - SYS_ADMIN
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
+    networks:
+      - dbus-testnet
+
+networks:
+  dbus-testnet:
+    driver: bridge

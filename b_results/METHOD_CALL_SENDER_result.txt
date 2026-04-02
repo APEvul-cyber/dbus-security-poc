@@ -1,0 +1,130 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Host: Typical Linux desktop or server.
+  - Service: A privileged password manager service `com.example.PasswordVault1` running as root, listening on a Unix-domain socket that speaks the D‑Bus wire protocol in **peer‑to‑peer mode**, not over a shared message bus (e.g., socket at `/run/passwordvault1.sock`).
+  - The service exposes:
+    - `path = /com/example/PasswordVault1`
+    - `interface = com.example.PasswordVault1.Secrets`
+    - `member = RetrieveSecret` with signature `"s"` (label: STRING).
+  - The service uses the D‑Bus **SENDER** header as a “connection identifier” and uses it to:
+    - Map `SENDER → per‑client secret store`.
+    - Authorize `RetrieveSecret` based on which `SENDER` “owns” the requested secret.
+  - There is **no mediating D‑Bus bus daemon**; messages go directly from client to service.
+  - The server is implemented with a low‑level D‑Bus library (or even manual parsing) that does **not override or inject** the SENDER header for peer‑to‑peer connections.
+  - This pattern is realistic: developers often port code that was originally written for `system` or `session` bus to a peer‑to‑peer socket, assuming the same trust properties for D‑Bus headers.
+
+- **Attacker Capability:**
+  - Local unprivileged user with the ability to:
+    - Connect to the `PasswordVault1` peer‑to‑peer D‑Bus socket.
+    - Send arbitrary D‑Bus `METHOD_CALL` messages to `com.example.PasswordVault1.Secrets`.
+    - **Fully control the SENDER header field** in those messages (by crafting raw D‑Bus messages or using a low‑level library that does not protect SENDER in peer‑to‑peer mode).
+  - The attacker can discover or guess other clients’ logical identifiers (e.g., strings like `":1.42"`) used by the service as per‑client keys.
+
+---
+
+**Attack Procedure:**
+
+1. **Understand the server’s trust model.**
+   - The root service, originally written for a bus‑mediated deployment, assumes:
+     - On the bus, SENDER is a unique connection name, assigned and enforced by the bus daemon.
+     - Therefore, SENDER is a reliable authentication/authorization key.
+   - In peer‑to‑peer mode, the developer reused the same logic:
+     ```c
+     // Pseudo-code inside PasswordVault1
+     const char *id = dbus_message_get_sender(msg);
+     SecretStore *store = lookup_store_by_id(id);
+     Secret *secret = store_get_secret(store, label);
+     return secret;
+     ```
+   - However, according to the D‑Bus specification:
+     - On a **message bus**, SENDER is controlled by the bus.
+     - Off the bus (peer‑to‑peer), SENDER is **controlled by the sender** unless there is out‑of‑band enforcement. It must not be trusted for authentication/authorization.
+
+2. **Obtain a victim’s “unique name” / logical identifier.**
+   - Common ways this identifier might be exposed:
+     - The service has additional methods such as `ListClients()` that enumerate known client IDs (a pattern seen in various IPC services to manage sessions).
+     - The victim’s client logs, debug output, or configuration files contain a stable ID like `":1.42"`.
+     - The service uses predictable IDs, e.g., `":1.1"`, `":1.2"`, etc.; the attacker can brute‑force several values until one works.
+   - Assume the attacker learns that a victim desktop application (running as another user, or mapping to a different logical “tenant”) is associated with the ID `":1.42"`.
+
+3. **Craft a malicious D‑Bus METHOD_CALL.**
+   - The attacker manually constructs a D‑Bus `METHOD_CALL` to:
+     - `PATH = /com/example/PasswordVault1`
+     - `INTERFACE = com.example.PasswordVault1.Secrets`
+     - `MEMBER = RetrieveSecret`
+     - `SIGNATURE = "s"`
+   - Critically, the attacker sets:
+     - `SENDER = ":1.42"` (the victim’s logical identifier)
+   - Body:
+     - A label that exists in the victim’s store (e.g., `"bank-account"`).
+
+4. **Send the message over the peer‑to‑peer socket.**
+   - Because there is no bus daemon:
+     - The SENDER header is **not rewritten or validated**.
+     - The peer‑to‑peer transport simply delivers the raw message to the service.
+
+5. **Service misinterprets SENDER and leaks secrets.**
+   - The service receives the message and calls `dbus_message_get_sender()`.
+   - It obtains `":1.42"` (provided by the attacker) and:
+     - Looks up the per‑client secret store associated with `":1.42"`.
+     - Finds the entry labeled `"bank-account"`.
+     - Returns the stored secret (e.g., password, token, encryption key) in the D‑Bus reply.
+   - From the service’s perspective, it believes the request came from the legitimate client `":1.42"` because it assumes SENDER is an authoritative identity assigned by a bus daemon.
+
+6. **Impact.**
+   - The attacker now has read access to secrets associated with other logical clients:
+     - Stored credentials (passwords, database credentials, private keys).
+     - API tokens or cookies used for privileged actions.
+   - Depending on what PasswordVault1 stores, this can lead to:
+     - Lateral movement between user accounts.
+     - Privilege escalation (e.g., retrieving root SSH private keys, keyring master passwords, or tokens granting elevated API access).
+   - If the service also allows modifications (e.g., `StoreSecret` or `DeleteSecret` using the same SENDER logic), the attacker can:
+     - Overwrite or delete another client’s secrets, causing denial of service or stealthy backdooring (e.g., replace a victim’s credentials with attacker‑controlled ones).
+
+7. **Why SENDER is the attack‑critical field.**
+   - The method arguments (`label`, etc.) are expected to be controlled by clients; they only select entries within the store.
+   - PATH, INTERFACE, MEMBER, and DESTINATION simply choose which method on which object is called.
+   - **The only value used as an “authentication token” is the SENDER header.**
+   - If the attacker sends an identical message but with a different SENDER (e.g., their real connection ID or any unrecognized ID):
+     - `lookup_store_by_id(id)` maps to the attacker’s store or fails.
+     - The service returns either the attacker’s own secrets or an error.
+   - Thus, **changing the SENDER header is what flips the identity context** used by the service and is directly responsible for the unauthorized access.
+
+---
+
+**Attack Message:**
+
+```json
+{
+  "dbus_header": {
+    "endianness": "l",
+    "message_type": "METHOD_CALL",
+    "flags": 0,
+    "protocol_version": 1,
+    "serial": 101
+  },
+  "header_fields": {
+    "PATH": "/com/example/PasswordVault1",
+    "INTERFACE": "com.example.PasswordVault1.Secrets",
+    "MEMBER": "RetrieveSecret",
+    "DESTINATION": "com.example.PasswordVault1",
+    "SENDER": ":1.42",
+    "SIGNATURE": "s"
+  },
+  "body": {
+    "label": "bank-account"
+  },
+  "_exploit_context": {
+    "field_under_attack": "SENDER",
+    "why_exploit_works": "In peer-to-peer D-Bus, SENDER is fully controlled by the sender and is not set or validated by a bus daemon. The service incorrectly assumes SENDER is an authenticated unique connection name (as on a message bus) and uses it as an authorization key for secret stores. By spoofing SENDER=':1.42', the attacker causes the service to treat their request as coming from the victim client associated with ':1.42', leaking that client's secrets.",
+    "spec_references": [
+      "D-Bus Specification: Header Fields table, SENDER (field code 7) – describes SENDER as the unique name of the sending connection and notes that on a message bus, it is controlled by the bus.",
+      "D-Bus Specification: discussion of non-message-bus servers – clarifies that outside a message bus, SENDER is controlled by the message sender unless out-of-band guarantees exist, so it must not be blindly trusted for authentication/authorization."
+    ]
+  }
+}
+```
+
+---
+
+**Classification:** ATTACK

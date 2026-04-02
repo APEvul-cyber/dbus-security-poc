@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.example.PowerManager1
+Exec=/usr/bin/python3 /usr/local/bin/powermanager1-service.py
+User=root

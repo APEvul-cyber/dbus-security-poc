@@ -1,0 +1,116 @@
+**Threat Model:**
+- **Attack Assumption:**
+  - Platform: A typical Linux system (e.g., a desktop or server distribution) using the system bus with standard `dbus-daemon`.
+  - Service: A privileged power-management service `org.example.PowerManager1` running as `root` on the system bus, exporting a `PowerOff` method intended to be restricted to authorized callers.
+  - Bus Policy: `/usr/share/dbus-1/system.d/org.example.PowerManager1.conf` (or similar) uses *interface-based* ACLs, e.g.:
+    - Allows unprivileged users to call benign methods on `org.example.PowerManager1`.
+    - Denies unprivileged users calling `PowerOff` *only when* `INTERFACE='org.example.PowerManager1.Manager'`.
+    - Fails to explicitly deny method calls to `PowerOff` when the INTERFACE header is **omitted**.
+  - Service Implementation: Uses a common D‑Bus stack (libdbus, GDBus, QtDBus) whose dispatcher:
+    - Routes method calls by `(PATH, MEMBER)` and uses `INTERFACE` if present;  
+    - Accepts calls with **no INTERFACE header** and dispatches the method as long as the `MEMBER` name is unambiguous.
+  - Threat Actor: A local unprivileged user with the ability to connect to the system bus (standard on most Linux systems).
+
+- **Attacker Capability:**
+  - Can open a connection to `/run/dbus/system_bus_socket` as an ordinary user.
+  - Can send arbitrary `METHOD_CALL` messages to `org.example.PowerManager1` on the system bus.
+  - Has *full control* over the `INTERFACE` header field, including the ability to **omit it entirely**.
+  - Can choose arbitrary `PATH`, `MEMBER`, `DESTINATION`, and method arguments consistent with what the bus and service will accept.
+
+---
+
+**Attack Procedure:**
+
+1. **Discovery / Reconnaissance**
+   - The attacker introspects `org.example.PowerManager1` (or uses documentation/strings in the binary) and learns that:
+     - It has an object `/org/example/PowerManager1`.
+     - It exports interface `org.example.PowerManager1.Manager` with method `PowerOff()`.
+     - Calling `PowerOff` results in a privileged operation (e.g., system shutdown via `reboot(RB_POWER_OFF)` or invoking `/sbin/poweroff`).
+   - The attacker tests a normal call:
+     - `INTERFACE='org.example.PowerManager1.Manager'`
+     - `MEMBER='PowerOff'`
+   - The system bus denies the call (e.g., `org.freedesktop.DBus.Error.AccessDenied`) due to interface-based policy rules:
+     ```xml
+     <deny send_destination="org.example.PowerManager1"
+           send_interface="org.example.PowerManager1.Manager"
+           send_member="PowerOff"/>
+     ```
+
+2. **Understanding the Policy Gap**
+   - The attacker consults the D‑Bus specification (or prior knowledge) and notes:
+     - The `INTERFACE` header field is **optional** for `METHOD_CALL`s.
+     - The spec explicitly warns: if access-control filters match on `INTERFACE`, they must also reject messages that *omit* `INTERFACE`, otherwise attackers can bypass ACLs by not sending the field.
+   - The attacker infers the bus policy is likely matching on `INTERFACE` and `MEMBER` but **does not handle the “no interface” case**.
+
+3. **Crafting the Bypass Call**
+   - The attacker constructs an otherwise identical `METHOD_CALL`:
+     - `DESTINATION = 'org.example.PowerManager1'`
+     - `PATH = '/org/example/PowerManager1'`
+     - `MEMBER = 'PowerOff'`
+     - **No `INTERFACE` header at all.**
+   - Because the bus config only has rules that reference `send_interface="org.example.PowerManager1.Manager"`, the policy engine:
+     - Does *not* match the “deny” rule (the message has no interface field).
+     - Falls back to a more permissive default (e.g., allow unprivileged callers for unspecified interface).
+   - Result: The `PowerOff` call is **forwarded** to `org.example.PowerManager1` instead of being blocked.
+
+4. **Service Dispatch & Privileged Action**
+   - The service’s D‑Bus dispatcher receives a method call:
+     - Correct `PATH`, `MEMBER = "PowerOff"`, but **no interface**.
+   - In common D‑Bus frameworks, dispatch proceeds as:
+     - If `INTERFACE` is present, dispatch to that interface’s vtable.
+     - If `INTERFACE` is missing, attempt to match by `MEMBER` name alone when unambiguous.
+   - Because `PowerOff` is uniquely defined (only one method with that name on that object), the dispatcher calls the privileged handler as if the correct interface had been specified.
+   - The handler executes the high-privilege operation (e.g., shutting down the machine).
+
+5. **Impact**
+   - The unprivileged attacker can now turn off the system at will:
+     - Persistent denial-of-service: repeatedly powering off the machine, disrupting services/users.
+     - Potential leverage in multi-user environments (e.g., forced reboots during security maintenance or to interfere with other users’ work).
+   - The critical factor is **attacker control over the `INTERFACE` header**, and specifically the ability to **omit it**:
+     - If `INTERFACE='org.example.PowerManager1.Manager'`, the ACL blocks the call.
+     - If `INTERFACE='org.example.Safe'` or any other allowed interface, the dispatcher either rejects it (no such method on that interface) or calls a benign method.
+     - Only the crafted case with **no INTERFACE field** both:
+       - Passes the bus policy, and
+       - Is treated by the service as a valid `PowerOff` request.
+
+   This directly matches the D‑Bus specification’s documented security warning: interface-based ACLs that do not also reject interface-less messages are bypassable by omitting the `INTERFACE` field.
+
+---
+
+**Attack Message:**
+
+```json
+{
+  "dbus_header": {
+    "endianness": "little",
+    "message_type": "METHOD_CALL",
+    "flags": 0,
+    "protocol_version": 1,
+    "serial": 42
+  },
+  "header_fields": {
+    "PATH": "/org/example/PowerManager1",
+    "MEMBER": "PowerOff",
+    "DESTINATION": "org.example.PowerManager1",
+
+    /*
+      Note: INTERFACE is intentionally omitted.
+      In a raw D-Bus message, this means the header
+      field with code = INTERFACE is not present at all.
+    */
+
+    "SIGNATURE": ""
+  },
+  "body": [],
+  "_exploit_context": {
+    "description": "Privilege-bypass via omission of INTERFACE header: the system bus policy only denies calls to member=PowerOff when INTERFACE='org.example.PowerManager1.Manager'. Because the INTERFACE field is absent here, the policy does not apply and the message is forwarded. The service's dispatcher accepts interface-less calls and dispatches uniquely by MEMBER name, causing an unauthorized power-off.",
+    "spec_reference": "D-Bus Specification, sections 'Header Fields' (INTERFACE is optional) and 'Method Calls' (warning that ACLs matching INTERFACE must also reject messages with no INTERFACE).",
+    "exploit_critical_field": "INTERFACE (specifically: the ability to omit it entirely)",
+    "why_critical": "Any value of INTERFACE that matches the ACL is denied; only by *not sending* INTERFACE at all does the message bypass the interface-based ACL and reach the handler."
+  }
+}
+```
+
+---
+
+**Classification:** ATTACK

@@ -1,0 +1,65 @@
+D-Bus 协议安全 PoC 验证测试报告
+================================
+测试时间: 2026-04-02
+测试环境: Docker (jrei/systemd-ubuntu:22.04), dbus-daemon 1.12.20
+
+PoC 1: METHOD_CALL MEMBER — USBCreator Image 权限提升
+------------------------------------------------------
+状态: ✅ 成功复现
+容器: dbus-poc12-usbcreator
+攻击: attacker(uid=1000) 调用 MEMBER=Image, source=/root/secret.txt, target=/tmp/stolen_secret.txt
+结果: 服务以 root(uid=0) 执行文件拷贝, 返回 boolean true
+      /etc/shadow 也被成功拷贝到 attacker 的 home 目录
+关键字段: MEMBER=Image 选择了特权代码路径, 其他 MEMBER 值(Version/GetStatus)不触发漏洞
+
+PoC 2: METHOD_CALL DESTINATION — USBCreator 路由
+-------------------------------------------------
+状态: ✅ 成功复现
+容器: dbus-poc12-usbcreator
+攻击: DESTINATION=com.ubuntu.USBCreator 将消息路由到 root 服务
+对照: DESTINATION=com.ubuntu.WRONG_SERVICE → ServiceUnknown 错误
+      DESTINATION=org.freedesktop.DBus → AccessDenied
+结果: 只有正确的 DESTINATION 才能将消息送达 root 权限的 USBCreator 服务
+关键字段: DESTINATION 决定消息路由, 是攻击的必要条件
+
+PoC 3: METHOD_CALL INTERFACE 省略绕过 send_interface ACL
+---------------------------------------------------------
+状态: ❌ 无法在当前环境复现 (CVE-2008-0595 已修复)
+容器: dbus-poc3-interface-acl
+测试: 带 INTERFACE 的 PowerOff → AccessDenied ✓
+      省略 INTERFACE 的 PowerOff → AccessDenied ✓ (修复后也被拦截)
+原因: dbus-daemon 1.12.20 (>= 1.2.4) 已修复 CVE-2008-0595
+      修复机制: send_interface deny 规则现在也匹配 interface=(unset) 的消息
+      要复现需要 dbus-daemon < 1.2.4 (2008年之前的版本)
+
+PoC 4: METHOD_CALL SENDER 伪造 (P2P 模式)
+-------------------------------------------
+状态: ✅ 成功复现
+容器: dbus-poc45-p2p-signal
+攻击: attacker(uid=1000) 连接 P2P socket, 伪造 SENDER=:1.42
+结果:
+  - SENDER=:1.999 (自身) → 无关联密钥, 返回空
+  - SENDER=:1.42 (伪造受害者) → 返回 bank-account, email, ssh-key 全部密钥
+  - SENDER=:1.100 (伪造管理员) → 返回 admin-token, database 密码
+关键字段: SENDER 在 P2P 模式下完全由客户端控制, 服务端错误信任导致身份冒充
+
+PoC 5: SIGNAL INTERFACE 欺骗
+-----------------------------
+状态: ✅ 成功复现
+容器: dbus-poc45-p2p-signal
+攻击: attacker(uid=1000) 发送伪造 SIGNAL:
+      INTERFACE=org.freedesktop.UDisks2.Manager, MEMBER=JobCompleted
+      PATH=/org/freedesktop/UDisks2
+结果: root 服务(com.example.PowerManager1) 收到信号并执行了特权操作
+      两次伪造信号均被服务端处理, 记录在 /tmp/signal-attack-log.txt
+关键字段: INTERFACE 由发送者控制, bus daemon 不验证 INTERFACE 归属
+      服务端仅按 INTERFACE+MEMBER+PATH 匹配信号, 不验证 SENDER
+
+总结
+----
+5 个 PoC 中 4 个成功复现, 1 个因 CVE 已修复无法在现代系统上复现:
+  PoC 1 (MEMBER):      ✅ 复现
+  PoC 2 (DESTINATION):  ✅ 复现
+  PoC 3 (INTERFACE):    ❌ CVE-2008-0595 已修复
+  PoC 4 (SENDER P2P):   ✅ 复现
+  PoC 5 (SIGNAL):       ✅ 复现

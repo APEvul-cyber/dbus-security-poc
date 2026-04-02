@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=com.example.PowerManager1
+Exec=/usr/bin/python3 /usr/local/bin/signal-listener-service.py
+User=root

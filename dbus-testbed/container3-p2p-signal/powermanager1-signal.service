@@ -1,0 +1,13 @@
+[Unit]
+Description=PowerManager1 Signal Listener (PoC 5 Target)
+After=dbus.service
+Requires=dbus.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/signal-listener-service.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Simulated USBCreator D-Bus Service (CVE-2013-1060)
+After=dbus.service
+Requires=dbus.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/usb-creator-service.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
