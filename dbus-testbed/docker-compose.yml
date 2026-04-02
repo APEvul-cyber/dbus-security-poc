@@ -83,6 +83,31 @@ services:
     networks:
       - dbus-testnet
 
+  # ============================================================
+  # 容器 4: 真实服务攻击面测试
+  # Ubuntu 22.04 + 真实 udisks2/packagekit/networkmanager/bluez 等
+  # ============================================================
+  real-services:
+    build:
+      context: ./container-real
+      dockerfile: Dockerfile
+    container_name: dbus-real-services
+    hostname: real-services
+    privileged: true
+    volumes:
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    tmpfs:
+      - /run
+      - /run/lock
+    command: /sbin/init
+    cap_add:
+      - SYS_ADMIN
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
+    networks:
+      - dbus-testnet
+
 networks:
   dbus-testnet:
     driver: bridge

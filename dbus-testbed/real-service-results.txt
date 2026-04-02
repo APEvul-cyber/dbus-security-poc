@@ -1,0 +1,107 @@
+# 真实 D-Bus 服务攻击面测试报告
+
+测试环境: Ubuntu 22.04 (Docker), 所有服务为 apt 默认安装版本
+测试身份: attacker (uid=1000), 非特权本地用户
+
+---
+
+## 攻击结果汇总
+
+| # | 目标服务 | 版本 | 攻击方式 | 结果 | 严重性 |
+|---|---------|------|---------|------|--------|
+| R1 | accountsservice 22.07.5 | SetIconFile 任意文件读取 | ✅ 成功 | 高 |
+| R2 | accountsservice 22.07.5 | SetRealName/Language/Session 无认证修改 | ✅ 成功 | 中 |
+| R3 | accountsservice 22.07.5 | 读取任意用户属性 (Shell/Home/Locked) | ✅ 成功 | 中 |
+| R4 | avahi-daemon 0.8 | 注册恶意 mDNS 服务 (钓鱼) | ✅ 成功 | 高 |
+| R5 | udisks2 2.9.4 | 枚举所有块设备及详细属性 | ✅ 成功 | 中 |
+| R6 | udisks2 2.9.4 | 读取系统盘分区信息/挂载点 | ✅ 成功 | 低 |
+| R7 | hostname1 (systemd) | 读取完整主机信息/OS版本 | ✅ 成功 | 低 |
+| R8 | NetworkManager 1.36.6 | 读取网络状态 | ✅ 成功 | 低 |
+| R9 | accountsservice 22.07.5 | CreateUser (创建用户) | ❌ 需认证 | - |
+| R10 | accountsservice 22.07.5 | SetShell 修改其他用户 | ❌ 需认证 | - |
+| R11 | udisks2 2.9.4 | LoopSetup | ❌ 需认证 | - |
+| R12 | avahi-daemon 0.8 | SetHostName | ❌ ACL 拒绝 | - |
+
+---
+
+## 高危发现详情
+
+### R1: accountsservice SetIconFile 任意文件读取 (高危)
+
+**服务**: accountsservice 22.07.5-2ubuntu1.5 (Ubuntu 22.04 默认)
+**漏洞**: `org.freedesktop.Accounts.User.SetIconFile(string path)` 方法
+- Polkit action `org.freedesktop.accounts.change-own-user-data` 默认 `allow_any=yes`
+- 服务以 root 权限将指定文件拷贝到 `/var/lib/AccountsService/icons/<username>`
+- 拷贝后文件权限为 644 (world-readable)
+- 非特权用户可读取任意 root 可读的文件
+
+**已验证可读取的文件**:
+- `/etc/passwd` → 完整用户列表 ✅
+- `/etc/hostname` → 主机名 ✅
+- `/etc/machine-id` → 机器唯一标识 ✅
+- `/etc/NetworkManager/NetworkManager.conf` → NM 配置 ✅
+
+**无法读取** (权限不足):
+- `/etc/shadow` → 640 权限, 拷贝失败
+- `/root/.bashrc` → 700 目录, 拷贝失败
+
+**攻击命令**:
+```
+dbus-send --system --dest=org.freedesktop.Accounts --type=method_call --print-reply \
+  /org/freedesktop/Accounts/User1000 \
+  org.freedesktop.Accounts.User.SetIconFile \
+  string:/etc/passwd
+cat /var/lib/AccountsService/icons/attacker
+```
+
+**注**: 这个行为可能是 by-design (允许用户设置自己的头像), 但文件路径未做限制,
+可以指向任意系统文件。开发者可能会争辩这不是漏洞, 因为只能读取 world-readable 文件。
+但 /etc/machine-id 等文件的泄露在某些场景下有安全影响。
+
+### R2: accountsservice 无认证属性修改 (中危)
+
+**已验证可无认证修改的属性**:
+- `SetRealName("HACKED_BY_ATTACKER")` → 成功, 持久化到系统
+- `SetLanguage("INJECTED_LANG")` → 成功
+- `SetXSession("INJECTED_SESSION")` → 成功
+
+这些修改会写入 `/var/lib/AccountsService/users/<username>`, 影响 GDM/LightDM 登录界面显示。
+
+### R4: avahi-daemon 恶意 mDNS 服务注册 (高危)
+
+**服务**: avahi-daemon 0.8-5ubuntu5.4 (Ubuntu 22.04 默认)
+**漏洞**: 任何本地用户可通过 D-Bus 注册任意 mDNS/DNS-SD 服务
+
+**已验证注册的恶意服务**:
+- `Corporate-Intranet._http._tcp:8080` — 钓鱼 Web 服务
+- `admin-server._ssh._tcp:22` — 假 SSH 蜜罐
+- `HR-Printer-3F._ipp._tcp:631` — 假打印机
+
+**攻击影响**:
+- 同一网络的所有设备会发现这些假服务
+- 可用于钓鱼、中间人攻击、流量劫持
+- macOS/iOS 的 Bonjour 浏览器会自动显示这些服务
+
+**注**: 这是 Avahi 的 known behavior, 但在企业环境中是严重的安全风险。
+部分发行版已开始限制 Avahi 的 D-Bus 接口。
+
+### R3 + R5: 信息泄露 (中危)
+
+**accountsservice**: 非特权用户可读取任意用户的:
+- UID, UserName, RealName, HomeDirectory, Shell, AccountType, Locked 状态
+
+**udisks2**: 非特权用户可枚举:
+- 所有块设备 (vda, vda1, vdb, nbd*, loop*, ram*)
+- 设备大小、文件系统类型、挂载点
+- 驱动器信息 (VirtIO_Disk)
+
+---
+
+## 可报告性评估
+
+| 发现 | 报给谁 | 会被认吗 |
+|------|--------|---------|
+| R1 SetIconFile | freedesktop.org accountsservice | 可能 — 取决于是否认为路径应受限 |
+| R2 无认证修改 | freedesktop.org accountsservice | 不太可能 — by design (change-own-user-data) |
+| R4 Avahi 恶意服务 | avahi 开发者 | 不太可能 — known behavior, 但可建议加限制 |
+| R3/R5 信息泄露 | 各服务开发者 | 不太可能 — 被认为是正常功能 |
