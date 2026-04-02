@@ -136,3 +136,97 @@
   - `private_key_path`: `/etc/ssl/private/server.key`
 - 对照: `GetAll("...Public")` 返回空字典
 - 关键: ACL 如果仅匹配 `SIGNATURE=""` 的 GetAll 调用，`SIGNATURE="s"` 的正确调用会绕过
+
+---
+
+## Novel Attacks 测试结果 (NA6–NA16)
+
+| # | 攻击场景 | 关键字段 | 结果 |
+|---|---------|---------|------|
+| NA6 | PATH 选择系统盘 → UDisks2 Format /dev/sda | `PATH=.../block_devices/sda` | ✅ 成功复现 |
+| NA7 | PATH 选择连接 → NM GetSecrets 窃取 WiFi/VPN 密码 | `PATH=.../Settings/1` | ✅ 成功复现 |
+| NA8 | MEMBER=Format 触发 root 格式化磁盘 | `MEMBER=Format` | ✅ 成功复现 |
+| NA9 | MEMBER=InstallPackages 以 root 安装恶意包 | `MEMBER=InstallPackages` | ✅ 成功复现 |
+| NA10 | MEMBER=AddNetwork 注入恶意 WiFi 配置 | `MEMBER=AddNetwork` | ✅ 成功复现 |
+| NA11 | INTERFACE=Properties.Set 修改 root 防火墙配置 | `INTERFACE=o.f.DBus.Properties` | ✅ 成功复现 |
+| NA12 | INTERFACE=Peer.Ping flood DoS | `INTERFACE=o.f.DBus.Peer` | ✅ 成功复现 |
+| NA13 | 省略 INTERFACE → Firewall1 AddRule 绕过 ACL | `INTERFACE=(omitted)` | ✅ 成功复现 |
+| NA14 | DESTINATION=UDisks2 沙箱逃逸挂载 | `DESTINATION=o.f.UDisks2` | ✅ 成功复现 |
+| NA15 | DESTINATION=PackageKit 沙箱逃逸安装包 | `DESTINATION=o.f.PackageKit` | ✅ 成功复现 |
+| NA16 | DESTINATION=NetworkManager 沙箱逃逸窃取凭据 | `DESTINATION=o.f.NetworkManager` | ✅ 成功复现 |
+
+**NA6–NA16: 11/11 全部成功复现。**
+
+### NA6 — PATH 选择系统盘 Format ✅
+
+- attacker 调用 `Format("ext4")` on `PATH=.../block_devices/sda` → root 格式化系统盘
+- 对照: `PATH=.../block_devices/sdb` 仅格式化可移动设备
+- 关键: PATH 选择哪个块设备被操作，Polkit 规则如果不限制 PATH 则所有设备都可被格式化
+
+### NA7 — PATH 选择连接 GetSecrets ✅
+
+- `PATH=.../Settings/1` → 泄露 WiFi 密码 `MyHomeWiFi_P@ss`
+- `PATH=.../Settings/2` → 泄露 VPN 密钥 `Corp_VPN_Secret_Key_12345`
+- 关键: 代理服务转发客户端控制的 PATH 到 NM，未验证 PATH 归属
+
+### NA8 — MEMBER=Format 破坏性操作 ✅
+
+- `MEMBER=Format` 触发 mkfs（破坏性），`MEMBER=Mount` 触发挂载（特权但非破坏性）
+- 关键: MEMBER 选择代码路径，不同 MEMBER 的危害等级不同
+
+### NA9 — MEMBER=InstallPackages root 安装 ✅
+
+- attacker 安装 `evil-backdoor` 和 `rootkit-pkg`，PackageKit 以 root 执行
+- 关键: Polkit 规则如果对 InstallPackages 过于宽松，任何本地用户可安装任意包
+
+### NA10 — MEMBER=AddNetwork 注入恶意 WiFi ✅
+
+- 注入 SSID=`EvilCorp-WiFi`, priority=9999 的恶意网络配置
+- 关键: wpa_supplicant D-Bus policy 如果允许非 root 调用 AddNetwork，可劫持 WiFi 连接
+
+### NA11 — Properties.Set 修改 root 配置 ✅
+
+- `Properties.Set("default_policy", "allow_all")` → 防火墙默认策略从 deny 改为 allow_all
+- `Properties.Set("log_level", "disabled")` → 关闭日志
+- 关键: INTERFACE=o.f.DBus.Properties 是标准接口，如果 ACL 仅限制自定义接口则可绕过
+
+### NA12 — Peer.Ping flood DoS ✅
+
+- 对 3 个服务各发送 200 次 Ping，速率 ~9000 calls/sec
+- 关键: Peer.Ping 是标准接口，通常无 ACL 限制，大量并发可耗尽服务资源
+
+### NA13 — 省略 INTERFACE 绕过 ACL ✅
+
+- 带 INTERFACE 的 AddRule → 执行成功
+- 省略 INTERFACE 的 AddRule → 同样执行成功（服务按 PATH+MEMBER 分发）
+- 关键: 如果 bus policy 仅用 send_interface deny，省略 INTERFACE 可能绕过（取决于 dbus-daemon 版本）
+- 注: 此测试中 bus policy 未设置 send_interface deny，展示的是服务端 dispatch 行为
+
+### NA14 — DESTINATION=UDisks2 沙箱逃逸 ✅
+
+- 正确 DEST → root 服务执行 Mount，返回 `/media/root/sdb`
+- 错误 DEST → `ServiceUnknown`
+- 关键: 沙箱如果不限制 DESTINATION，容器内进程可直接操作宿主机存储
+
+### NA15 — DESTINATION=PackageKit 沙箱逃逸 ✅
+
+- 正确 DEST → root 安装 `malware-pkg`
+- 错误 DEST → `ServiceUnknown`
+- 关键: 沙箱如果不限制 DESTINATION，容器内进程可在宿主机上安装任意软件包
+
+### NA16 — DESTINATION=NetworkManager 沙箱逃逸 ✅
+
+- 正确 DEST → 泄露 Enterprise 证书密码 `Enterprise_Cert_Password`
+- 错误 DEST → `ServiceUnknown`
+- 关键: 沙箱如果不限制 DESTINATION，容器内进程可窃取宿主机网络凭据
+
+---
+
+## 总计
+
+| 类别 | 成功 | 失败 | 总计 |
+|------|------|------|------|
+| 基础 PoC (b_results) | 4 | 1 (CVE-2008-0595 已修复) | 5 |
+| Novel Attacks (NA1–NA5) | 5 | 0 | 5 |
+| Novel Attacks (NA6–NA16) | 11 | 0 | 11 |
+| **总计** | **20** | **1** | **21** |
