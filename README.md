@@ -1,5 +1,9 @@
 # dbus-security-poc
 
-Lab reproductions of **known** D-Bus issues (CVE-2013-1060 USBCreator, DESTINATION routing, SENDER/SIGNAL spoof). CVE-2008-0595 (omit INTERFACE) did **not** reproduce on dbus-daemon 1.12.20.
+D-Bus fields attackers set. USBCreator Image is also CVE-2013-1060. Omit-INTERFACE (CVE-2008-0595) did not reproduce on dbus-daemon 1.12.20.
 
-This is not a set of new CVEs. Kept as PoC/testbed only.
+| Dir | Issue |
+|---|---|
+| `destination-routing` | DESTINATION routes an unprivileged message to a root service |
+| `sender-spoof-p2p` | P2P D-Bus trusts client-supplied SENDER |
+| `signal-interface-spoof` | SIGNAL INTERFACE is not bound to the sender |
